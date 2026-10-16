@@ -345,9 +345,9 @@ function InstanceRules() {
   return (
     <div className="mt-4 overflow-hidden rounded-[14px] border border-line bg-surface shadow-card">
       <p className="px-[18px] pt-3.5 text-[13px] leading-[1.55] text-ink-soft">
-        Rules for the whole instance. Every canvas follows them, and every agent that connects — the built-in ones and
-        people’s own — receives the agent instructions among them. A workspace or canvas rule with the same name
-        overrides one here.
+        Rules for the whole instance, visible to every account and agent on this install. Every canvas follows them, and
+        every agent that connects — the built-in ones and people’s own — receives the agent instructions among them. A
+        workspace or canvas style guide with the same name overrides one here; agent instructions can’t be overridden.
       </p>
       <ScopedGuides scopeApi={scopeApi} canEdit hint="No instance rules yet." />
     </div>

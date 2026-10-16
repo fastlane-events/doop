@@ -272,8 +272,9 @@ function RulesPane({ ws, admin }: { ws: WorkspaceDetail; admin: boolean }) {
         <CardTitle>Rules</CardTitle>
         <CardDescription>
           Every canvas in {ws.name} follows these, and every agent working on one reads them: style guides for how
-          designs look, agent instructions for how agents work. A canvas’s own rule with the same name overrides one
-          here.{admin ? '' : ' Only workspace admins can change them.'}
+          designs look, agent instructions for how agents work. Visible to members of this workspace. A canvas’s own
+          style guide with the same name overrides one here; agent instructions can’t be overridden.
+          {admin ? '' : ' Only workspace admins can change them.'}
         </CardDescription>
       </CardHeader>
       <ScopedGuides scopeApi={scopeApi} canEdit={admin} hint="No workspace rules yet." />

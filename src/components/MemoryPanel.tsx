@@ -34,15 +34,16 @@ export function MemoryPanel() {
   /** name of the open inherited (read-only) guide */
   const [openInherited, setOpenInherited] = useState<string | null>(null)
 
-  /* the workspace and instance docs this canvas follows: those no canvas
-     doc of the same name overrides, the workspace's winning over the install's */
+  /* the workspace and instance docs this canvas follows: merged the way the
+     server merges them — a style doc a canvas doc of the same name
+     overrides drops out, an organisation rule (instructions) never does */
   const inherited = useMemo(() => {
     const own = new Set((docs ?? []).map((d) => d.name))
     const layers = inheritedDocs ?? []
     return mergeGuidelines([
       layers.filter((d) => d.scope === 'instance'),
       layers.filter((d) => d.scope === 'workspace'),
-    ]).filter((d) => !own.has(d.name))
+    ]).filter((d) => d.kind === 'instructions' || !own.has(d.name))
   }, [docs, inheritedDocs])
   const source = useMemo<GuideSource | null>(
     () =>
