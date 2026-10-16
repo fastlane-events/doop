@@ -197,6 +197,13 @@
       "when": 1791579850954,
       "tag": "0028_slack_agent",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1792126289040,
+      "tag": "0029_scoped_guidelines",
+      "breakpoints": true
     }
   ]
 }

@@ -418,6 +418,8 @@ export const guidelines = pgTable(
     markdown: text('markdown').notNull(),
     /* pretty display name; null = show the slug */
     title: text('title'),
+    /* 'style' (what frames look like) | 'instructions' (how agents work) */
+    kind: text('kind').notNull().default('style'),
     updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
     updatedBy: text('updated_by').notNull(),
     /* world position of the card on the canvas; null = auto-placed */
@@ -425,6 +427,39 @@ export const guidelines = pgTable(
     y: doublePrecision('y'),
   },
   (t) => [primaryKey({ columns: [t.canvasId, t.name] })],
+)
+
+/** Guideline docs above the canvas: a workspace's (scope_id = its id) or the
+ *  whole install's (scope 'instance', scope_id ''). Every canvas inherits
+ *  them; hydrated into the store at boot like the canvas docs. */
+export const scopedGuidelines = pgTable(
+  'scoped_guidelines',
+  {
+    scopeType: text('scope_type').notNull(),
+    scopeId: text('scope_id').notNull(),
+    name: text('name').notNull(),
+    markdown: text('markdown').notNull(),
+    title: text('title'),
+    kind: text('kind').notNull().default('style'),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+    updatedBy: text('updated_by').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.scopeType, t.scopeId, t.name] })],
+)
+
+/** History of scoped guideline docs, same shape and cap as guideline_versions. */
+export const scopedGuidelineVersions = pgTable(
+  'scoped_guideline_versions',
+  {
+    id: text('id').primaryKey(),
+    scopeType: text('scope_type').notNull(),
+    scopeId: text('scope_id').notNull(),
+    name: text('name').notNull(),
+    markdown: text('markdown').notNull(),
+    savedAt: bigint('saved_at', { mode: 'number' }).notNull(),
+    savedBy: text('saved_by').notNull(),
+  },
+  (t) => [index('scoped_guideline_versions_doc_idx').on(t.scopeType, t.scopeId, t.name)],
 )
 
 /** Append-only history of guideline docs: one snapshot per save, an empty
