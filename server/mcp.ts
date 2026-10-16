@@ -644,9 +644,9 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
           `agents cannot set ${scope} rules — a person sets them in Doop (${scope === 'workspace' ? 'the workspace settings, Rules' : 'Admin, Rules'}) or over its REST API. Use scope "canvas" for this canvas's own docs.`,
         )
       const actor = actorFrom(agent_name)
+      const reader = readerOf(canvas_id, agent_name)
       try {
         const doc = actions.setGuideline(canvas_id, name, markdown, actor, undefined, title, kind)
-        const reader = readerOf(canvas_id, agent_name)
         actions.markGuidelinesSeen(canvas_id, reader.agent, reader.workspace)
         return withFeedback(
           text(
@@ -665,7 +665,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
           actor,
         )
       } catch (e) {
-        return err(e instanceof Error ? e.message : 'invalid guideline doc')
+        return err(actions.guidelineErrorFor(e, reader.workspace))
       }
     },
   )

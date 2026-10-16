@@ -1470,8 +1470,8 @@ export function setGuideline(
     return null
   }
 
-  if (inheritedGuidelines(canvasId, true).some((d) => d.name === slug && d.kind === 'instructions'))
-    throw new Error(`“${slug}” is the name of an organisation rule this canvas follows — pick another name`)
+  const rule = reservedGuidelineNames(canvasId).get(slug)
+  if (rule) throw new ReservedGuidelineName(slug, rule)
   const existing = store.getGuidelines(canvasId)
   if (!existing.some((d) => d.name === slug) && existing.length >= MAX_GUIDELINE_DOCS)
     throw new Error(`this canvas already has ${MAX_GUIDELINE_DOCS} design guides — delete one first`)
@@ -1482,6 +1482,45 @@ export function setGuideline(
   logActivity(canvasId, actor, `updated the design guide “${guidelineTitle(doc)}”`)
   touch(canvasId, actor)
   return doc
+}
+
+/** A canvas doc name taken by an organisation rule the canvas inherits: the
+ *  write is refused, since the rule cannot be shadowed. */
+export class ReservedGuidelineName extends Error {
+  constructor(
+    readonly slug: string,
+    readonly scope: InheritedScope,
+  ) {
+    super(`“${slug}” is the name of an organisation rule this canvas follows — pick another name`)
+  }
+}
+
+/** The organisation rules' names on a canvas (instance and workspace
+ *  `instructions` docs), with the scope of each — what no canvas doc may be
+ *  called. */
+export function reservedGuidelineNames(canvasId: string): Map<string, InheritedScope> {
+  return new Map(
+    inheritedGuidelines(canvasId, true)
+      .filter((d) => d.kind === 'instructions')
+      .map((d) => [d.name, d.scope as InheritedScope]),
+  )
+}
+
+/** A guideline write's error as one caller may read it. A workspace rule's
+ *  name is the members' business: a caller without durable access to the
+ *  canvas learns only that the name is taken. */
+export function guidelineErrorFor(e: unknown, durable: boolean): string {
+  if (e instanceof ReservedGuidelineName && e.scope === 'workspace' && !durable)
+    return `“${e.slug}” cannot be used for a doc on this canvas — pick another name`
+  return e instanceof Error ? e.message : 'invalid doc'
+}
+
+/** Canvases whose own doc of this name an organisation rule now hides — the
+ *  admin saving the rule is told, and the canvas's Memory flags the doc. */
+export function shadowedCanvasDocs(scope: InheritedScope, scopeId: string, name: string) {
+  return [...store.canvases.values()]
+    .filter((c) => (scope === 'instance' || c.workspaceId === scopeId) && c.guidelines?.some((d) => d.name === name))
+    .map((c) => ({ id: c.id, name: c.name }))
 }
 
 /** The instance scope has one id: the install itself. */

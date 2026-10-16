@@ -1342,7 +1342,8 @@ app.get('/api/canvases/:id/guidelines/:name/history', async (req, res) => {
 })
 
 app.put('/api/canvases/:id/guidelines/:name', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
   const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
   const { markdown, x, y, title, kind } = req.body ?? {}
   if (kind !== undefined && !isGuidelineKind(kind))
@@ -1371,7 +1372,7 @@ app.put('/api/canvases/:id/guidelines/:name', (req, res) => {
     if (doc === undefined) return res.status(404).json({ error: 'not found' })
     res.json(doc ? { ok: true, doc } : { ok: true, deleted: true })
   } catch (e) {
-    res.status(400).json({ error: e instanceof Error ? e.message : 'invalid doc' })
+    res.status(400).json({ error: actions.guidelineErrorFor(e, hasDurableCanvasAccess(req.user!.id, c)) })
   }
 })
 
@@ -1397,11 +1398,18 @@ app.delete('/api/canvases/:id/references/:refId', (req, res) => {
 })
 
 app.post('/api/canvases/:id/proposals/:pid', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
   const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
-  const proposal = actions.resolveProposal(req.params.id, req.params.pid, !!req.body?.accept, actor)
-  if (!proposal) return res.status(404).json({ error: 'proposal not found' })
-  res.json(proposal)
+  try {
+    const proposal = actions.resolveProposal(req.params.id, req.params.pid, !!req.body?.accept, actor)
+    if (!proposal) return res.status(404).json({ error: 'proposal not found' })
+    res.json(proposal)
+  } catch (e) {
+    /* accepting failed (its guide's name is now an organisation rule's):
+       nothing was written, the proposal stays pending to dismiss */
+    res.status(400).json({ error: actions.guidelineErrorFor(e, hasDurableCanvasAccess(req.user!.id, c)) })
+  }
 })
 
 /* Browser asset uploads (paste / drop): raw image bytes in, permanent /a/
