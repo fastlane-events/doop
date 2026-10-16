@@ -63,9 +63,9 @@ import { GEMINI_MODELS, OPENROUTER_MODELS } from '../shared/modelMenu.ts'
 import type { ModelOption } from '../shared/modelMenu.ts'
 import { mentionedRole } from '../shared/agents.ts'
 import { activeAgentTasks } from '../shared/agentActivity.ts'
-import { colorFor } from '../shared/types.ts'
+import { colorFor, isGuidelineKind } from '../shared/types.ts'
 import { isPeerViewport } from '../shared/viewport.ts'
-import type { ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
+import type { Canvas, ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
 
 const PORT = env.PORT
 
@@ -94,6 +94,7 @@ if (data.canvases.length === 0 && (await persist.importLegacyJson())) {
   data = await persist.hydrate()
 }
 store.init(data.canvases)
+store.initScopedGuidelines(data.scopedGuidelines)
 await workspaces.hydrateWorkspaces() // before the first request: canAccessCanvas reads membership
 await webhooks.hydrateWebhooks()
 billing.reportBillingConfig()
@@ -155,6 +156,8 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
 interface Conn {
   ws: WebSocket
   canvasId: string
+  /** the session's account — decides what reaches this viewer (see broadcast) */
+  userId: string
   presence: Presence
   /** an admin viewing as someone else: receives updates, emits nothing.
    *  Showing their borrowed identity as a live cursor would tell the room
@@ -172,9 +175,16 @@ function send(ws: WebSocket, msg: ServerMessage) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
 }
 
-function broadcast(canvasId: string, msg: ServerMessage, excludeClientId?: string) {
+function broadcast(
+  canvasId: string,
+  msg: ServerMessage,
+  excludeClientId?: string,
+  opts: { durableOnly?: boolean } = {},
+) {
+  const canvas = opts.durableOnly ? store.getCanvas(canvasId) : undefined
   for (const c of room(canvasId)) {
     if (excludeClientId && c.presence.clientId === excludeClientId) continue
+    if (opts.durableOnly && (!canvas || !hasDurableCanvasAccess(c.userId, canvas))) continue
     send(c.ws, msg)
   }
 }
@@ -544,9 +554,11 @@ app.post('/api/account-exists', async (req, res) => {
 
 /* Public: is SSO configured, and what should the login button say? Static
    build shared across self-hosted deploys can't know this at build time —
-   see server/auth.ts loginProvidersConfig for what's safe to expose here. */
+   see server/auth.ts loginProvidersConfig for what's safe to expose here.
+   Also where this deployment's source code is (DOOP_SOURCE_URL): public on
+   purpose, since the AGPL offers it to everyone who reaches the server. */
 app.get('/api/oidc-config', (req, res) => {
-  res.json(loginProvidersConfig())
+  res.json({ ...loginProvidersConfig(), sourceUrl: env.DOOP_SOURCE_URL })
 })
 
 /* ------------------------------------------------------------------ */
@@ -627,6 +639,13 @@ app.get('/api/me', async (req, res) => {
 /* Canvas access on the REST surface: resolve the canvas (or the frame's
    canvas) and run it through canAccessCanvas before touching anything.
    Both helpers write the error response themselves and return null. */
+/** A canvas as one viewer gets it: with the instance guidelines it inherits,
+ *  and its workspace's when the viewer has durable access (a share-link
+ *  visitor does not) — the store keeps both outside the canvas. */
+function withInheritedGuidelines(c: Canvas, userId: string): Canvas {
+  return { ...c, inheritedGuidelines: actions.inheritedGuidelines(c.id, hasDurableCanvasAccess(userId, c)) }
+}
+
 function requireCanvas(req: express.Request, res: express.Response, canvasId: string) {
   const c = store.getCanvas(canvasId)
   if (!c) {
@@ -919,7 +938,7 @@ app.post('/api/canvases/:id/duplicate', async (req, res) => {
 
 app.get('/api/canvases/:id', (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
-  if (c) res.json(c)
+  if (c) res.json(withInheritedGuidelines(c, req.user!.id))
 })
 
 /* Community gallery listing — the owner's call alone, like link access.
@@ -1323,9 +1342,12 @@ app.get('/api/canvases/:id/guidelines/:name/history', async (req, res) => {
 })
 
 app.put('/api/canvases/:id/guidelines/:name', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
   const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
-  const { markdown, x, y, title } = req.body ?? {}
+  const { markdown, x, y, title, kind } = req.body ?? {}
+  if (kind !== undefined && !isGuidelineKind(kind))
+    return res.status(400).json({ error: "kind must be 'style' or 'instructions'" })
   /* no markdown = metadata patch (position/title): content and history untouched */
   if (markdown === undefined) {
     const patch = {
@@ -1345,11 +1367,12 @@ app.put('/api/canvases/:id/guidelines/:name', (req, res) => {
       actor,
       pos,
       typeof title === 'string' ? title : undefined,
+      kind,
     )
     if (doc === undefined) return res.status(404).json({ error: 'not found' })
     res.json(doc ? { ok: true, doc } : { ok: true, deleted: true })
   } catch (e) {
-    res.status(400).json({ error: e instanceof Error ? e.message : 'invalid doc' })
+    res.status(400).json({ error: actions.guidelineErrorFor(e, hasDurableCanvasAccess(req.user!.id, c)) })
   }
 })
 
@@ -1375,11 +1398,18 @@ app.delete('/api/canvases/:id/references/:refId', (req, res) => {
 })
 
 app.post('/api/canvases/:id/proposals/:pid', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
   const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
-  const proposal = actions.resolveProposal(req.params.id, req.params.pid, !!req.body?.accept, actor)
-  if (!proposal) return res.status(404).json({ error: 'proposal not found' })
-  res.json(proposal)
+  try {
+    const proposal = actions.resolveProposal(req.params.id, req.params.pid, !!req.body?.accept, actor)
+    if (!proposal) return res.status(404).json({ error: 'proposal not found' })
+    res.json(proposal)
+  } catch (e) {
+    /* accepting failed (its guide's name is now an organisation rule's):
+       nothing was written, the proposal stays pending to dismiss */
+    res.status(400).json({ error: actions.guidelineErrorFor(e, hasDurableCanvasAccess(req.user!.id, c)) })
+  }
 })
 
 /* Browser asset uploads (paste / drop): raw image bytes in, permanent /a/
@@ -1884,14 +1914,14 @@ wss.on('connection', (ws, upgradeReq) => {
         activeFrameId: null,
       }
       const silent = !!(session.session as { impersonatedBy?: string | null }).impersonatedBy
-      conns.set(ws, { ws, canvasId: msg.canvasId, presence, silent })
+      conns.set(ws, { ws, canvasId: msg.canvasId, userId: session.user.id, presence, silent })
       const others = room(msg.canvasId)
         .filter((c) => c.ws !== ws && !c.silent)
         .map((c) => c.presence)
       const agents = [...(agentPresences.get(msg.canvasId)?.values() ?? [])]
       send(ws, {
         type: 'init',
-        canvas,
+        canvas: withInheritedGuidelines(canvas, session.user.id),
         presences: [...others, ...agents],
         activity: actions.getActivity(msg.canvasId),
         tasks: actions.getTasks(msg.canvasId),

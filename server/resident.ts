@@ -14,9 +14,11 @@ import * as backgrounds from './backgrounds.ts'
 import * as ingest from './ingest.ts'
 import { viewWebsite, referencedUrls } from './website.ts'
 import { createImportedWebpageFrame, findImportedWebpageFrame } from './webpageImport.ts'
-import { DESIGN_BRIEF, DESIGN_QUALITY } from './guide.ts'
+import { canvasNotes, DESIGN_BRIEF, DESIGN_QUALITY, organisationRules } from './guide.ts'
+import * as workspaces from './workspaces.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
 import type { Actor, AgentTask, Frame } from '../shared/types.ts'
+import { isGuidelineKind } from '../shared/types.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { executeGuardedBatch } from './guardedBatch.ts'
 import { runRepoCards } from './githubRecon.ts'
@@ -454,17 +456,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       /* canvas design docs ride as a second system block with their own cache
          breakpoint: the role prefix stays cacheable across canvases, and the
          (rarely-changing) docs cache across the turns of a run */
-      const guidelineDocs = store.getGuidelines(canvasId)
-      const guidelinesBlock = guidelineDocs.length
-        ? [
-            {
-              text:
-                `# Canvas design guidelines\nEvery frame on this canvas must follow these docs — they outrank your own aesthetic preferences:\n\n` +
-                guidelineDocs.map((d) => `## ${d.name}\n\n${d.markdown}`).join('\n\n'),
-              cache: true,
-            },
-          ]
-        : []
+      const guidelinesBlock = guidelineBlocks(canvasId)
       /* a text-only model would otherwise chase tools whose whole value is
          pixels; steer its verification to the textual surfaces instead */
       const noVisionBlock = runState.vision
@@ -747,6 +739,38 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
 /** What the agent's panel entry currently says, or '' when nothing is open. */
 function currentStatus(canvasId: string, actor: Actor): string {
   return actions.getTasks(canvasId).find((t) => t.agentName === actor.name && !t.endedAt && !t.queuedBy)?.status ?? ''
+}
+
+/** The guideline system block for a run on a canvas: its style docs (its
+ *  own and inherited) as design guidelines; the instance's and its
+ *  workspace's `instructions` docs as the organisation's rules, rendered the
+ *  way get_guide serves them to external agents; its own `instructions`
+ *  docs, lower down, as notes from its editors. Always with the workspace's
+ *  docs, whoever asked for the run: the canvas is the workspace's, and the
+ *  system prompt never reaches the requester. */
+export function guidelineBlocks(canvasId: string): { text: string; cache: boolean }[] {
+  const canvas = store.getCanvas(canvasId)
+  const docs = actions.effectiveGuidelines(canvasId, true)
+  const style = docs.filter((d) => d.kind === 'style')
+  const workspaceId = canvas?.workspaceId ?? ''
+  const rules = organisationRules([
+    { label: 'instance', docs: docs.filter((d) => d.scope === 'instance') },
+    {
+      label: `workspace "${workspaces.getWorkspace(workspaceId)?.name ?? workspaceId}"`,
+      docs: docs.filter((d) => d.scope === 'workspace'),
+    },
+  ])
+  const text = [
+    style.length
+      ? `# Canvas design guidelines\nEvery frame on this canvas must follow these docs — they outrank your own aesthetic preferences:\n\n` +
+        style.map((d) => `## ${d.name}\n\n${d.markdown}`).join('\n\n')
+      : '',
+    rules,
+    canvasNotes(docs.filter((d) => d.scope === 'canvas')),
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+  return text ? [{ text, cache: true }] : []
 }
 
 const TOOLS: Anthropic.Tool[] = [
@@ -1040,6 +1064,12 @@ const TOOLS: Anthropic.Tool[] = [
           type: 'string',
           description:
             'Pretty display name shown to humans, e.g. "Pipefile design system"; omit to keep the current one',
+        },
+        kind: {
+          type: 'string',
+          enum: ['style', 'instructions'],
+          description:
+            "'style' (default for a new doc): how frames look. 'instructions': how agents work. Omit to keep the current kind",
         },
       },
       required: ['name', 'markdown'],
@@ -1538,10 +1568,11 @@ async function execTool(
         }
       }
       case 'set_guidelines': {
-        const raw = block.input as { name?: string; markdown?: string; title?: string }
+        const raw = block.input as { name?: string; markdown?: string; title?: string; kind?: string }
         if (typeof raw.name !== 'string' || !raw.name.trim()) return fail('name must be a non-empty slug')
         if (typeof raw.markdown !== 'string') return fail('markdown must be a string (empty string deletes the doc)')
-        const doc = actions.setGuideline(canvasId, raw.name, raw.markdown, actor, undefined, raw.title)
+        if (raw.kind !== undefined && !isGuidelineKind(raw.kind)) return fail("kind must be 'style' or 'instructions'")
+        const doc = actions.setGuideline(canvasId, raw.name, raw.markdown, actor, undefined, raw.title, raw.kind)
         if (doc === undefined) return fail('canvas not found')
         return ok(
           doc

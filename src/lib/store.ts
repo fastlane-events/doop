@@ -9,6 +9,7 @@ import type {
   ElementComment,
   Frame,
   GuidelineDoc,
+  InheritedScope,
   MemoryProposal,
   MemoryReference,
   PeerViewport,
@@ -148,7 +149,7 @@ interface State {
   removeFrame(frameId: string): void
   renameCanvasLocal(name: string): void
   /** upsert (doc set) or remove (doc null) a style guide on the open canvas */
-  setGuidelineLocal(name: string, doc: GuidelineDoc | null): void
+  setGuidelineLocal(name: string, doc: GuidelineDoc | null, scope?: InheritedScope): void
   /** pin (reference set) or unpin (null) a Memory reference on the open canvas */
   setReferenceLocal(id: string, reference: MemoryReference | null): void
   setDecisions(decisions: DesignDecision[]): void
@@ -413,9 +414,15 @@ export const useStore = create<State>((set, get) => ({
       }
     }),
   renameCanvasLocal: (name) => set((s) => (s.canvas ? { canvas: { ...s.canvas, name } } : {})),
-  setGuidelineLocal: (name, doc) =>
+  setGuidelineLocal: (name, doc, scope) =>
     set((s) => {
       if (!s.canvas) return {}
+      if (scope) {
+        /* a workspace or instance doc this canvas inherits */
+        const inherited = (s.canvas.inheritedGuidelines ?? []).filter((d) => d.scope !== scope || d.name !== name)
+        if (doc) inherited.push({ ...doc, scope })
+        return { canvas: { ...s.canvas, inheritedGuidelines: inherited } }
+      }
       const docs = (s.canvas.guidelines ?? []).filter((d) => d.name !== name)
       if (doc) {
         docs.push(doc)

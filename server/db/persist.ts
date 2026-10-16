@@ -6,7 +6,7 @@ import { db } from './index.ts'
 import * as t from './schema.ts'
 import { extractAssetIds } from '../assets.ts'
 import { roleByAgentName } from '../../shared/agents.ts'
-import { isCommunityCategory } from '../../shared/types.ts'
+import { isCommunityCategory, isGuidelineKind } from '../../shared/types.ts'
 import type {
   ActivityItem,
   AgentTask,
@@ -17,6 +17,7 @@ import type {
   ElementComment,
   Frame,
   GuidelineDoc,
+  InheritedScope,
   MemoryProposal,
   MemoryReference,
   RepoCardKind,
@@ -30,8 +31,26 @@ import type {
  * Nothing on the live path (presence, cursors, reveal ticks) awaits the DB.
  */
 
+/* writes in flight and how many failed, for drain() */
+const inFlight = new Set<Promise<unknown>>()
+let failedWrites = 0
+
 function swallow(p: Promise<unknown>) {
-  p.catch((err) => console.error('[db] write failed', err))
+  const write: Promise<unknown> = p
+    .catch((err) => {
+      failedWrites++
+      console.error('[db] write failed', err)
+    })
+    .finally(() => inFlight.delete(write))
+  inFlight.add(write)
+}
+
+/** Wait until every write issued so far has landed; resolves to how many
+ *  writes have failed. For one-shot processes (scripts/set-guideline.ts)
+ *  that must not exit mid-write — the server itself never waits. */
+export async function drain(): Promise<number> {
+  while (inFlight.size) await Promise.all([...inFlight])
+  return failedWrites
 }
 
 /** every mutable canvas column, so insert and upsert can't drift apart */
@@ -92,6 +111,7 @@ export async function saveCanvasCopy(c: Canvas): Promise<void> {
           name: doc.name,
           markdown: doc.markdown,
           title: doc.title ?? null,
+          kind: doc.kind,
           updatedAt: doc.updatedAt,
           updatedBy: doc.updatedBy,
           x: doc.x ?? null,
@@ -140,6 +160,7 @@ export function saveGuideline(canvasId: string, doc: GuidelineDoc) {
     name: doc.name,
     markdown: doc.markdown,
     title: doc.title ?? null,
+    kind: doc.kind,
     updatedAt: doc.updatedAt,
     updatedBy: doc.updatedBy,
     x: doc.x ?? null,
@@ -154,6 +175,7 @@ export function saveGuideline(canvasId: string, doc: GuidelineDoc) {
         set: {
           markdown: row.markdown,
           title: row.title,
+          kind: row.kind,
           updatedAt: row.updatedAt,
           updatedBy: row.updatedBy,
           x: row.x,
@@ -199,6 +221,117 @@ export function listGuidelineVersions(canvasId: string, name: string) {
     .from(t.guidelineVersions)
     .where(and(eq(t.guidelineVersions.canvasId, canvasId), eq(t.guidelineVersions.name, name)))
     .orderBy(desc(t.guidelineVersions.savedAt))
+}
+
+/* Workspace and instance guidelines: the same single-shot writes and capped
+   history as the canvas docs above, keyed by scope instead of canvas. */
+export function saveScopedGuideline(scope: InheritedScope, scopeId: string, doc: GuidelineDoc) {
+  const row = {
+    scopeType: scope,
+    scopeId,
+    name: doc.name,
+    markdown: doc.markdown,
+    title: doc.title ?? null,
+    kind: doc.kind,
+    updatedAt: doc.updatedAt,
+    updatedBy: doc.updatedBy,
+  }
+  swallow(
+    db
+      .insert(t.scopedGuidelines)
+      .values(row)
+      .onConflictDoUpdate({
+        target: [t.scopedGuidelines.scopeType, t.scopedGuidelines.scopeId, t.scopedGuidelines.name],
+        set: {
+          markdown: row.markdown,
+          title: row.title,
+          kind: row.kind,
+          updatedAt: row.updatedAt,
+          updatedBy: row.updatedBy,
+        },
+      }),
+  )
+}
+
+export function deleteScopedGuideline(scope: InheritedScope, scopeId: string, name: string) {
+  swallow(db.delete(t.scopedGuidelines).where(scopedDoc(scope, scopeId, name)))
+}
+
+function scopedDoc(scope: InheritedScope, scopeId: string, name: string) {
+  return and(
+    eq(t.scopedGuidelines.scopeType, scope),
+    eq(t.scopedGuidelines.scopeId, scopeId),
+    eq(t.scopedGuidelines.name, name),
+  )
+}
+
+function scopedVersionsOf(scope: InheritedScope, scopeId: string, name: string) {
+  return and(
+    eq(t.scopedGuidelineVersions.scopeType, scope),
+    eq(t.scopedGuidelineVersions.scopeId, scopeId),
+    eq(t.scopedGuidelineVersions.name, name),
+  )
+}
+
+export function saveScopedGuidelineVersion(
+  scope: InheritedScope,
+  scopeId: string,
+  name: string,
+  markdown: string,
+  by: string,
+  at: number,
+) {
+  swallow(appendScopedGuidelineVersion(scope, scopeId, name, markdown, by, at))
+}
+
+async function appendScopedGuidelineVersion(
+  scope: InheritedScope,
+  scopeId: string,
+  name: string,
+  markdown: string,
+  by: string,
+  at: number,
+) {
+  await db
+    .insert(t.scopedGuidelineVersions)
+    .values({ id: nanoid(10), scopeType: scope, scopeId, name, markdown, savedAt: at, savedBy: by })
+  const excess = await db
+    .select({ id: t.scopedGuidelineVersions.id })
+    .from(t.scopedGuidelineVersions)
+    .where(scopedVersionsOf(scope, scopeId, name))
+    .orderBy(desc(t.scopedGuidelineVersions.savedAt))
+    .offset(MAX_GUIDELINE_VERSIONS)
+  if (excess.length) {
+    await db.delete(t.scopedGuidelineVersions).where(
+      inArray(
+        t.scopedGuidelineVersions.id,
+        excess.map((e) => e.id),
+      ),
+    )
+  }
+}
+
+/** Newest first, like listGuidelineVersions. */
+export function listScopedGuidelineVersions(scope: InheritedScope, scopeId: string, name: string) {
+  return db
+    .select()
+    .from(t.scopedGuidelineVersions)
+    .where(scopedVersionsOf(scope, scopeId, name))
+    .orderBy(desc(t.scopedGuidelineVersions.savedAt))
+}
+
+/** A deleted workspace takes its guidelines and their history with it. */
+export function deleteScopedGuidelines(scope: InheritedScope, scopeId: string) {
+  swallow(
+    db
+      .delete(t.scopedGuidelines)
+      .where(and(eq(t.scopedGuidelines.scopeType, scope), eq(t.scopedGuidelines.scopeId, scopeId))),
+  )
+  swallow(
+    db
+      .delete(t.scopedGuidelineVersions)
+      .where(and(eq(t.scopedGuidelineVersions.scopeType, scope), eq(t.scopedGuidelineVersions.scopeId, scopeId))),
+  )
 }
 
 /* Design memory: single-shot writes, like guidelines. */
@@ -580,11 +713,42 @@ export interface Hydrated {
   activity: Map<string, ActivityItem[]>
   decisions: Map<string, DesignDecision[]>
   proposals: Map<string, MemoryProposal[]>
+  /** workspace and instance guideline docs, for store.initScopedGuidelines */
+  scopedGuidelines: { scope: InheritedScope; scopeId: string; doc: GuidelineDoc }[]
 }
 
 const LOG_CAP = 100
 /** the chat keeps more history than the other logs — it is the conversation */
 export const CHAT_LOG_CAP = 300
+
+type ScopedGuidelineRow = typeof t.scopedGuidelines.$inferSelect
+
+function toScopedGuidelines(rows: ScopedGuidelineRow[]): Hydrated['scopedGuidelines'] {
+  return rows.flatMap((g) =>
+    g.scopeType === 'workspace' || g.scopeType === 'instance'
+      ? [
+          {
+            scope: g.scopeType as InheritedScope,
+            scopeId: g.scopeId,
+            doc: {
+              name: g.name,
+              markdown: g.markdown,
+              ...(g.title != null ? { title: g.title } : {}),
+              kind: isGuidelineKind(g.kind) ? g.kind : 'style',
+              updatedAt: g.updatedAt,
+              updatedBy: g.updatedBy,
+            },
+          },
+        ]
+      : [],
+  )
+}
+
+/** The workspace and instance docs alone — for a process that needs them
+ *  without the rest of hydrate() (scripts/set-guideline.ts). */
+export async function loadScopedGuidelines(): Promise<Hydrated['scopedGuidelines']> {
+  return toScopedGuidelines(await db.select().from(t.scopedGuidelines).orderBy(t.scopedGuidelines.name))
+}
 
 export async function hydrate(): Promise<Hydrated> {
   const [
@@ -600,6 +764,7 @@ export async function hydrate(): Promise<Hydrated> {
     decisionRows,
     proposalRows,
     memberRows,
+    scopedGuidelineRows,
   ] = await Promise.all([
     db.select().from(t.canvases),
     db.select().from(t.frames),
@@ -613,6 +778,7 @@ export async function hydrate(): Promise<Hydrated> {
     db.select().from(t.decisions).orderBy(desc(t.decisions.at)),
     db.select().from(t.memoryProposals).orderBy(desc(t.memoryProposals.at)),
     db.select().from(t.canvasMembers).orderBy(t.canvasMembers.addedAt),
+    db.select().from(t.scopedGuidelines).orderBy(t.scopedGuidelines.name),
   ])
 
   const canvases: Canvas[] = canvasRows.map((c) => ({
@@ -659,6 +825,7 @@ export async function hydrate(): Promise<Hydrated> {
       name: g.name,
       markdown: g.markdown,
       ...(g.title != null ? { title: g.title } : {}),
+      kind: isGuidelineKind(g.kind) ? g.kind : 'style',
       updatedAt: g.updatedAt,
       updatedBy: g.updatedBy,
       ...(g.x != null ? { x: g.x } : {}),
@@ -848,7 +1015,9 @@ export async function hydrate(): Promise<Hydrated> {
     proposals.set(row.canvasId, list)
   }
 
-  return { canvases, tasks, feedback, comments, chat, activity, decisions, proposals }
+  const scopedGuidelines = toScopedGuidelines(scopedGuidelineRows)
+
+  return { canvases, tasks, feedback, comments, chat, activity, decisions, proposals, scopedGuidelines }
 }
 
 /** One-time import of the pre-DB data/store.json so existing canvases survive. */

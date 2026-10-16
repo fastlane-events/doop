@@ -11,6 +11,8 @@ import type {
   CommunityCategory,
   CommunityItem,
   Frame,
+  GuidelineDoc,
+  GuidelineKind,
   WorkspaceDetail,
   WorkspaceInvite,
   WorkspaceMember,
@@ -261,6 +263,29 @@ export async function req<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json()
 }
 
+/** One saved version of a guideline; '' markdown marks a deletion. */
+export interface GuidelineVersion {
+  markdown: string
+  savedAt: number
+  savedBy: string
+}
+
+/** What a guideline save answers; `hidden` lists the canvases whose own doc
+ *  of that name a just-saved organisation rule now hides. */
+export interface GuidelineSaveResult {
+  ok: boolean
+  doc?: GuidelineDoc
+  deleted?: boolean
+  hidden?: { id: string; name: string }[]
+}
+
+function putGuideline(url: string, markdown: string, title?: string, kind?: GuidelineKind) {
+  return req<GuidelineSaveResult>(url, {
+    method: 'PUT',
+    body: JSON.stringify({ markdown, ...(title !== undefined ? { title } : {}), ...(kind ? { kind } : {}) }),
+  })
+}
+
 export const api = {
   listWebhooks: () => req<WebhookInfo[]>('/api/webhooks'),
   createWebhook: (input: { url: string; events: WebhookEventType[] }) =>
@@ -349,15 +374,16 @@ export const api = {
       body: JSON.stringify({ screens, design_system: designSystem }),
     }),
   guidelineHistory: (canvasId: string, name: string) =>
-    req<{ markdown: string; savedAt: number; savedBy: string }[]>(
-      `/api/canvases/${canvasId}/guidelines/${encodeURIComponent(name)}/history`,
-    ),
+    req<GuidelineVersion[]>(`/api/canvases/${canvasId}/guidelines/${encodeURIComponent(name)}/history`),
   /* empty markdown deletes the guide; title is the pretty display name */
-  setGuideline: (canvasId: string, name: string, markdown: string, title?: string) =>
-    req(`/api/canvases/${canvasId}/guidelines/${encodeURIComponent(name)}`, {
-      method: 'PUT',
-      body: JSON.stringify({ markdown, ...(title !== undefined ? { title } : {}) }),
-    }),
+  setGuideline: (canvasId: string, name: string, markdown: string, title?: string, kind?: GuidelineKind) =>
+    putGuideline(`/api/canvases/${canvasId}/guidelines/${encodeURIComponent(name)}`, markdown, title, kind),
+  /* the guidelines every canvas in a workspace inherits (admins write) */
+  workspaceGuidelines: (id: string) => req<GuidelineDoc[]>(`/api/workspaces/${id}/guidelines`),
+  workspaceGuidelineHistory: (id: string, name: string) =>
+    req<GuidelineVersion[]>(`/api/workspaces/${id}/guidelines/${encodeURIComponent(name)}/history`),
+  setWorkspaceGuideline: (id: string, name: string, markdown: string, title?: string, kind?: GuidelineKind) =>
+    putGuideline(`/api/workspaces/${id}/guidelines/${encodeURIComponent(name)}`, markdown, title, kind),
   /* design memory */
   pinReference: (canvasId: string, frameId: string) =>
     req(`/api/canvases/${canvasId}/references`, { method: 'POST', body: JSON.stringify({ frameId }) }),
@@ -534,6 +560,12 @@ export const adminApi = {
   canvases: () => req<{ total: number; canvases: AdminCanvas[] }>('/api/admin/canvases'),
   stats: () => req<{ users: number; canvases: number; frames: number }>('/api/admin/stats'),
   users: () => req<AdminUser[]>('/api/admin/users'),
+  /* the install's guidelines, inherited by every canvas */
+  guidelines: () => req<GuidelineDoc[]>('/api/admin/guidelines'),
+  guidelineHistory: (name: string) =>
+    req<GuidelineVersion[]>(`/api/admin/guidelines/${encodeURIComponent(name)}/history`),
+  setGuideline: (name: string, markdown: string, title?: string, kind?: GuidelineKind) =>
+    putGuideline(`/api/admin/guidelines/${encodeURIComponent(name)}`, markdown, title, kind),
 
   /* better-auth's own endpoints, not ours: they swap the session cookie, so
      every caller reloads afterwards rather than trying to reconcile state. */

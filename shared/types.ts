@@ -111,6 +111,9 @@ export interface Canvas {
   pages?: CanvasPageInfo[]
   /** named design docs (brand rules, style recipes) every actor on the canvas follows */
   guidelines?: GuidelineDoc[]
+  /** the workspace and instance docs this canvas inherits, unmerged — served
+   *  with the canvas (GET /api/canvases/:id), never stored on it */
+  inheritedGuidelines?: ScopedGuidelineDoc[]
   /** frames pinned to Memory as style exemplars — HTML snapshotted at pin time */
   references?: MemoryReference[]
 }
@@ -247,11 +250,49 @@ export interface GuidelineDoc {
   /** pretty display name (e.g. "Featured Images"); fall back to the slug */
   title?: string
   markdown: string
+  /** visual style the frames follow, or working rules the agents follow */
+  kind: GuidelineKind
   updatedAt: number
   updatedBy: string
   /** world position of the card on the canvas; unset = auto-placed */
   x?: number
   y?: number
+}
+
+export const GUIDELINE_KINDS = ['style', 'instructions'] as const
+export type GuidelineKind = (typeof GUIDELINE_KINDS)[number]
+
+export function isGuidelineKind(value: unknown): value is GuidelineKind {
+  return typeof value === 'string' && (GUIDELINE_KINDS as readonly string[]).includes(value)
+}
+
+/** Where a guideline lives. A canvas follows the docs of every scope above
+ *  it: the install's, its workspace's (if any), then its own — merged by
+ *  name, the nearest scope winning. */
+export const GUIDELINE_SCOPES = ['canvas', 'workspace', 'instance'] as const
+export type GuidelineScope = (typeof GUIDELINE_SCOPES)[number]
+/** the scopes a canvas inherits from rather than owns */
+export type InheritedScope = Exclude<GuidelineScope, 'canvas'>
+export function isGuidelineScope(value: unknown): value is GuidelineScope {
+  return typeof value === 'string' && (GUIDELINE_SCOPES as readonly string[]).includes(value)
+}
+
+/** A guideline as a canvas sees it: the doc plus the scope that served it. */
+export interface ScopedGuidelineDoc extends GuidelineDoc {
+  scope: GuidelineScope
+}
+
+/** Merge guideline layers ordered farthest scope first (instance, workspace,
+ *  canvas): a style doc replaces any same-named doc from a farther scope,
+ *  but an `instructions` doc is the organisation's rule and nothing nearer
+ *  shadows it. */
+export function mergeGuidelines(layers: ScopedGuidelineDoc[][]): ScopedGuidelineDoc[] {
+  const byName = new Map<string, ScopedGuidelineDoc>()
+  for (const layer of layers)
+    for (const doc of layer) {
+      if (byName.get(doc.name)?.kind !== 'instructions') byName.set(doc.name, doc)
+    }
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name))
 }
 
 export type ActorKind = 'user' | 'agent'
@@ -498,8 +539,9 @@ export type ServerMessage =
   | { type: 'frame:streaming'; frameId: string; active: boolean; actor: Actor }
   | { type: 'canvas:renamed'; name: string; actor: Actor }
   | { type: 'canvas:pages'; pages: CanvasPageInfo[]; actor: Actor }
-  /** a style-guide doc was written, moved (doc set) or deleted (doc null) */
-  | { type: 'guidelines'; name: string; doc: GuidelineDoc | null; actor: Actor }
+  /** a style-guide doc was written, moved (doc set) or deleted (doc null);
+   *  `scope` set = a workspace or instance doc this canvas inherits */
+  | { type: 'guidelines'; name: string; doc: GuidelineDoc | null; actor: Actor; scope?: InheritedScope }
   /** a frame was pinned to (reference set) or unpinned from (null) Memory */
   | { type: 'reference'; id: string; reference: MemoryReference | null; actor: Actor }
   /** a design decision was captured into Memory */

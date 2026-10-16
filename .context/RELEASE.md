@@ -24,6 +24,11 @@ on port 4400 alongside a `postgres:16-alpine` container, and applies DB migratio
 (`server/db/index.ts`). CI (`ci.yml`) validates every push/PR to `main` (typecheck, lint,
 format:check, build, test) but does not build or push a container image.
 
+A deployment running a modified build must offer its source to network users (AGPL-3.0 §13): set
+`DOOP_SOURCE_URL` to the source of what is deployed and every page shows a small "Source code"
+link (`src/components/SourceLink.tsx`, fed by the public `/api/oidc-config`) — in the corner, or
+on the canvas in the Connect AI dialog — and the MCP initialize instructions name it. Unset, none.
+
 ## Desktop app (Tauri: macOS DMG + Windows NSIS installer)
 
 Driven by `.github/workflows/desktop-release.yml`; every desktop job shares the toolchain setup

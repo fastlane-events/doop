@@ -1,7 +1,52 @@
 import { nanoid } from 'nanoid'
 import { canvasPages, pageFrames } from '../shared/pages.ts'
 import * as persist from './db/persist.ts'
-import type { Canvas, CommunityCategory, Frame, GuidelineDoc, MemoryReference } from '../shared/types.ts'
+import type {
+  Canvas,
+  CommunityCategory,
+  Frame,
+  GuidelineDoc,
+  GuidelineKind,
+  InheritedScope,
+  MemoryReference,
+} from '../shared/types.ts'
+
+function scopeKey(scope: InheritedScope, scopeId: string): string {
+  return `${scope}:${scopeId}`
+}
+
+/** Write a doc into a name-sorted list in place: a new doc defaults to
+ *  'style'; an omitted title or kind keeps the current one. */
+function upsertGuideline(
+  docs: GuidelineDoc[],
+  name: string,
+  markdown: string,
+  by: string,
+  title?: string,
+  kind?: GuidelineKind,
+): GuidelineDoc {
+  const now = Date.now()
+  const doc = docs.find((d) => d.name === name)
+  if (doc) {
+    doc.markdown = markdown
+    doc.updatedAt = now
+    doc.updatedBy = by
+    if (title !== undefined) doc.title = title || undefined
+    if (kind) doc.kind = kind
+    return doc
+  }
+  const created: GuidelineDoc = {
+    name,
+    markdown,
+    ...(title ? { title } : {}),
+    kind: kind ?? 'style',
+    updatedAt: now,
+    updatedBy: by,
+  }
+  docs.push(created)
+  docs.sort((a, b) => a.name.localeCompare(b.name))
+  return created
+}
 
 /**
  * In-memory canvas/frame state — the hot path for reads, reveals and
@@ -11,6 +56,8 @@ import type { Canvas, CommunityCategory, Frame, GuidelineDoc, MemoryReference } 
 class Store {
   canvases = new Map<string, Canvas>()
   private frameIndex = new Map<string, string>() // frameId -> canvasId
+  /** workspace and instance guideline docs, keyed `${scope}:${scopeId}` */
+  private scopedGuidelines = new Map<string, GuidelineDoc[]>()
 
   init(canvases: Canvas[]) {
     for (const c of canvases) {
@@ -328,25 +375,15 @@ class Store {
     by: string,
     pos?: { x: number; y: number },
     title?: string,
+    kind?: GuidelineKind,
   ): GuidelineDoc | undefined {
     const c = this.canvases.get(canvasId)
     if (!c) return undefined
     const docs = (c.guidelines ??= [])
-    const now = Date.now()
-    let doc = docs.find((d) => d.name === name)
-    if (doc) {
-      doc.markdown = markdown
-      doc.updatedAt = now
-      doc.updatedBy = by
-      if (pos) Object.assign(doc, pos)
-      if (title !== undefined) doc.title = title || undefined
-    } else {
-      const placed = pos ?? this.placeGuideline(c, docs.length)
-      doc = { name, markdown, ...(title ? { title } : {}), updatedAt: now, updatedBy: by, ...placed }
-      docs.push(doc)
-      docs.sort((a, b) => a.name.localeCompare(b.name))
-    }
-    c.updatedAt = now
+    const placed = pos ?? (docs.some((d) => d.name === name) ? undefined : this.placeGuideline(c, docs.length))
+    const doc = upsertGuideline(docs, name, markdown, by, title, kind)
+    if (placed) Object.assign(doc, placed)
+    c.updatedAt = doc.updatedAt
     persist.saveGuideline(canvasId, doc)
     persist.saveCanvas(c)
     return doc
@@ -385,6 +422,51 @@ class Store {
     persist.deleteGuideline(canvasId, name)
     persist.saveCanvas(c)
     return true
+  }
+
+  initScopedGuidelines(rows: { scope: InheritedScope; scopeId: string; doc: GuidelineDoc }[]) {
+    this.scopedGuidelines.clear()
+    for (const { scope, scopeId, doc } of rows) {
+      const key = scopeKey(scope, scopeId)
+      this.scopedGuidelines.set(key, [...(this.scopedGuidelines.get(key) ?? []), doc])
+    }
+  }
+
+  /** A workspace's docs (scopeId = its id) or the instance's (scopeId ''). */
+  getScopedGuidelines(scope: InheritedScope, scopeId: string): GuidelineDoc[] {
+    return this.scopedGuidelines.get(scopeKey(scope, scopeId)) ?? []
+  }
+
+  setScopedGuideline(
+    scope: InheritedScope,
+    scopeId: string,
+    name: string,
+    markdown: string,
+    by: string,
+    title?: string,
+    kind?: GuidelineKind,
+  ): GuidelineDoc {
+    const key = scopeKey(scope, scopeId)
+    const docs = this.scopedGuidelines.get(key) ?? []
+    this.scopedGuidelines.set(key, docs)
+    const doc = upsertGuideline(docs, name, markdown, by, title, kind)
+    persist.saveScopedGuideline(scope, scopeId, doc)
+    return doc
+  }
+
+  deleteScopedGuideline(scope: InheritedScope, scopeId: string, name: string): boolean {
+    const docs = this.scopedGuidelines.get(scopeKey(scope, scopeId))
+    const idx = docs?.findIndex((d) => d.name === name) ?? -1
+    if (!docs || idx === -1) return false
+    docs.splice(idx, 1)
+    persist.deleteScopedGuideline(scope, scopeId, name)
+    return true
+  }
+
+  /** Forget a deleted workspace's docs, here and in the database. */
+  dropScopedGuidelines(scope: InheritedScope, scopeId: string) {
+    this.scopedGuidelines.delete(scopeKey(scope, scopeId))
+    persist.deleteScopedGuidelines(scope, scopeId)
   }
 
   getReferences(canvasId: string): MemoryReference[] {

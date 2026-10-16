@@ -118,6 +118,9 @@ async function distill(canvasId: string) {
   const decisions = actions.undistilledDecisions(canvasId).slice(0, MAX_WINDOW)
   if (decisions.length === 0) return
   const guides = store.getGuidelines(canvasId)
+  /* an accepted proposal writes a canvas doc, which may not take the name
+     of an organisation rule the canvas follows */
+  const reserved = actions.reservedGuidelineNames(canvasId)
 
   const guideList = guides.length
     ? guides.map((g) => `- ${g.name} ("${actions.guidelineTitle(g)}"): ${actions.guidelineSummary(g)}`).join('\n')
@@ -146,7 +149,13 @@ ${decisionList}
 Style guides already on this canvas:
 ${guideList}
 
-Rules previously suggested from this memory (dismissed = the human rejected it; never re-propose it or a trivial variant):
+${
+  reserved.size
+    ? `Names taken by the organisation's rules — never use one as guide_name: ${[...reserved.keys()].join(', ')}
+
+`
+    : ''
+}Rules previously suggested from this memory (dismissed = the human rejected it; never re-propose it or a trivial variant):
 ${proposalList}
 
 If these decisions reveal a durable style preference, distill it into ONE markdown bullet for the most fitting guide. Judge by substance, not count:
@@ -181,8 +190,10 @@ Do not restate anything a guide already covers. Prefer an existing guide's slug;
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 64)
+  let guideName = actions.GUIDELINE_NAME_RE.test(slug) && !reserved.has(slug) ? slug : 'style-notes'
+  for (let n = 2; reserved.has(guideName); n++) guideName = `style-notes-${n}`
   const proposal = actions.addProposal(canvasId, {
-    guideName: actions.GUIDELINE_NAME_RE.test(slug) ? slug : 'style-notes',
+    guideName,
     guideTitle: input.guide_title?.trim().slice(0, 80) || undefined,
     rule: input.rule.trim(),
     rationale: input.rationale?.trim() || 'Distilled from recent feedback.',

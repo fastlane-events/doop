@@ -6,6 +6,8 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({ navigate: vi.fn(), capture: vi.fn() }))
 vi.mock('../src/App', () => ({ navigate: mocks.navigate }))
 vi.mock('../src/lib/posthog', () => ({ posthog: { capture: mocks.capture } }))
+/* no server here: the source offer has its own test (sourceLink.test.tsx) */
+vi.mock('../src/lib/sourceUrl', () => ({ useSourceUrl: () => null }))
 vi.mock('../src/lib/store', () => ({
   useStore: (select: (s: { presences: Record<string, never> }) => unknown) => select({ presences: {} }),
 }))

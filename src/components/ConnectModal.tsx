@@ -10,6 +10,7 @@ import { CodeBlock } from './ui/code-block'
 import { Dot } from './ui/dot'
 import { ChevronLeftIcon, PuzzleIcon } from './ui/icons'
 import { Modal, ModalActions, ModalEyebrow, ModalLede, ModalSpacer, ModalTitle } from './ui/modal'
+import { useSourceUrl } from '../lib/sourceUrl'
 import { cn } from '@/lib/utils'
 
 /**
@@ -75,6 +76,7 @@ export function ConnectModal({ canvasId, onClose }: { canvasId?: string; onClose
 
 function AgentPicker({ onPick }: { onPick: (agent: AgentId) => void }) {
   const [agent, setAgent] = useState<AgentId>('claude-code')
+  const sourceUrl = useSourceUrl()
   return (
     <>
       <div className={body}>
@@ -99,6 +101,19 @@ function AgentPicker({ onPick }: { onPick: (agent: AgentId) => void }) {
       </div>
 
       <ModalActions className={footer}>
+        {/* the AGPL §13 source offer: the canvas page has no corner link
+            (SourceLink), so this dialog — reachable at every width — carries it */}
+        {sourceUrl && (
+          <a
+            href={sourceUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="self-center py-2 text-[12px] text-ink-faint underline-offset-2 hover:text-ink hover:underline"
+          >
+            Source code
+          </a>
+        )}
+        <ModalSpacer />
         <Button
           variant="solid"
           onClick={() => {

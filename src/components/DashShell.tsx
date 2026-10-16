@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from './ui/dropdown-menu'
 import {
+  BookmarkIcon,
   BuildingIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -202,6 +203,8 @@ export const IconWorkspace = () => <BuildingIcon {...rail} />
 export const IconBilling = () => <CreditCardIcon {...rail} />
 export const IconLock = () => <LockIcon width={12} height={12} aria-hidden />
 export const IconGear = () => <GearIcon {...rail} />
+/** guidelines: the rules every canvas below inherits */
+export const IconRules = () => <BookmarkIcon {...rail} />
 export const IconShield = () => <ShieldIcon {...rail} />
 export const IconHelp = () => <HelpIcon {...rail} />
 export const IconOut = () => <LogOutIcon {...rail} />
