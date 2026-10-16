@@ -6,6 +6,9 @@ lists every file in this folder.
 
 ## Active
 
+- [scoped-guidelines.md](scoped-guidelines.md) - Guidelines on the workspace and the whole install
+  as well as the canvas, merged by name nearest-scope-first; `style` vs `instructions` docs; the
+  organisation's rules appended to `get_guide` and the resident prompt; who may write each scope.
 - [chatgpt-app.md](chatgpt-app.md) - Doop as a ChatGPT app: what app review needs from `/mcp`
   (discovery, DCR, explicit tool annotations, profile tool), the inline preview card component
   (`server/chatgptApp.ts`), the "Claude Design for ChatGPT" marketing page, and the manual
