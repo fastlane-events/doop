@@ -283,10 +283,15 @@ export interface ScopedGuidelineDoc extends GuidelineDoc {
 }
 
 /** Merge guideline layers ordered farthest scope first (instance, workspace,
- *  canvas): a doc replaces any same-named doc from a farther scope. */
+ *  canvas): a style doc replaces any same-named doc from a farther scope,
+ *  but an `instructions` doc is the organisation's rule and nothing nearer
+ *  shadows it. */
 export function mergeGuidelines(layers: ScopedGuidelineDoc[][]): ScopedGuidelineDoc[] {
   const byName = new Map<string, ScopedGuidelineDoc>()
-  for (const layer of layers) for (const doc of layer) byName.set(doc.name, doc)
+  for (const layer of layers)
+    for (const doc of layer) {
+      if (byName.get(doc.name)?.kind !== 'instructions') byName.set(doc.name, doc)
+    }
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name))
 }
 

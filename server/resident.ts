@@ -14,10 +14,11 @@ import * as backgrounds from './backgrounds.ts'
 import * as ingest from './ingest.ts'
 import { viewWebsite, referencedUrls } from './website.ts'
 import { createImportedWebpageFrame, findImportedWebpageFrame } from './webpageImport.ts'
-import { DESIGN_BRIEF, DESIGN_QUALITY, organisationRules } from './guide.ts'
+import { canvasNotes, DESIGN_BRIEF, DESIGN_QUALITY, organisationRules } from './guide.ts'
+import { hasDurableCanvasAccess } from './access.ts'
 import * as workspaces from './workspaces.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
-import type { Actor, AgentTask, Frame, GuidelineScope } from '../shared/types.ts'
+import type { Actor, AgentTask, Frame } from '../shared/types.ts'
 import { isGuidelineKind } from '../shared/types.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { executeGuardedBatch } from './guardedBatch.ts'
@@ -456,7 +457,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       /* canvas design docs ride as a second system block with their own cache
          breakpoint: the role prefix stays cacheable across canvases, and the
          (rarely-changing) docs cache across the turns of a run */
-      const guidelinesBlock = guidelineBlocks(canvasId)
+      const guidelinesBlock = guidelineBlocks(canvasId, payer || canvasOwner)
       /* a text-only model would otherwise chase tools whose whole value is
          pixels; steer its verification to the textual surfaces instead */
       const noVisionBlock = runState.vision
@@ -741,28 +742,33 @@ function currentStatus(canvasId: string, actor: Actor): string {
   return actions.getTasks(canvasId).find((t) => t.agentName === actor.name && !t.endedAt && !t.queuedBy)?.status ?? ''
 }
 
-/** The guideline system block for a run on a canvas: its style docs (its
- *  own and inherited) as design guidelines, and its `instructions` docs as
- *  the organisation's rules, rendered the way get_guide serves them to
- *  external agents. */
-function guidelineBlocks(canvasId: string): { text: string; cache: boolean }[] {
-  const docs = actions.effectiveGuidelines(canvasId)
+/** The guideline system block for a run on a canvas, for the person the run
+ *  works for (`requesterId`): its style docs (its own and inherited) as
+ *  design guidelines; the instance's and its workspace's `instructions` docs
+ *  as the organisation's rules, rendered the way get_guide serves them to
+ *  external agents; its own `instructions` docs, lower down, as notes from
+ *  its editors. The workspace's docs only for a requester with durable
+ *  access, as everywhere else. */
+function guidelineBlocks(canvasId: string, requesterId: string | undefined): { text: string; cache: boolean }[] {
+  const canvas = store.getCanvas(canvasId)
+  const withWorkspace = !!canvas && hasDurableCanvasAccess(requesterId, canvas)
+  const docs = actions.effectiveGuidelines(canvasId, withWorkspace)
   const style = docs.filter((d) => d.kind === 'style')
-  const workspaceId = store.getCanvas(canvasId)?.workspaceId
-  const label = (scope: GuidelineScope) =>
-    scope === 'workspace' ? `workspace "${workspaces.getWorkspace(workspaceId ?? '')?.name ?? workspaceId}"` : scope
-  const rules = organisationRules(
-    (['instance', 'workspace', 'canvas'] as const).map((scope) => ({
-      label: label(scope),
-      docs: docs.filter((d) => d.scope === scope),
-    })),
-  )
+  const workspaceId = canvas?.workspaceId ?? ''
+  const rules = organisationRules([
+    { label: 'instance', docs: docs.filter((d) => d.scope === 'instance') },
+    {
+      label: `workspace "${workspaces.getWorkspace(workspaceId)?.name ?? workspaceId}"`,
+      docs: docs.filter((d) => d.scope === 'workspace'),
+    },
+  ])
   const text = [
     style.length
       ? `# Canvas design guidelines\nEvery frame on this canvas must follow these docs — they outrank your own aesthetic preferences:\n\n` +
         style.map((d) => `## ${d.name}\n\n${d.markdown}`).join('\n\n')
       : '',
     rules,
+    canvasNotes(docs.filter((d) => d.scope === 'canvas')),
   ]
     .filter(Boolean)
     .join('\n\n')

@@ -7,14 +7,14 @@ import { fromNodeHeaders } from 'better-auth/node'
 import { z } from 'zod'
 import { store } from './store.ts'
 import * as actions from './actions.ts'
-import { canAccessCanvas } from './access.ts'
+import { canAccessCanvas, hasDurableCanvasAccess } from './access.ts'
 import { isAgentKeySecret, verifyAgentKey } from './agentKeys.ts'
 import * as workspaces from './workspaces.ts'
-import { auth, getUserName, isAdminUser, isBanned } from './auth.ts'
+import { auth, getUserName, isBanned } from './auth.ts'
 import { capture, captureThrottled } from './analytics.ts'
 import { renderFrame } from './screenshot.ts'
 import { primeImage } from './previews.ts'
-import { DOOP_GUIDE, GUIDE_TOPICS, organisationRules, type RuleSource } from './guide.ts'
+import { DOOP_GUIDE, GUIDE_TOPICS, organisationRules, workspaceRules } from './guide.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
 import { ESCAPED_HTML_NOTE, looksEscapedHtml } from './escapedHtml.ts'
 import { describeSyncFlow, getSyncFlow } from './ingest.ts'
@@ -71,7 +71,7 @@ function textWithNudge(data: unknown, nudge: string) {
 const REVIEW_NUDGE =
   'You have not seen this design yet. Call get_frame_screenshot on it now, judge it against the review checkpoints (fit, spacing, hierarchy, contrast, alignment, realism), and fix any issues before moving on.'
 
-import type { Actor, Frame, GuidelineScope, ScopedGuidelineDoc } from '../shared/types.ts'
+import type { Actor, Frame, ScopedGuidelineDoc } from '../shared/types.ts'
 import { GUIDELINE_KINDS, GUIDELINE_SCOPES } from '../shared/types.ts'
 
 /** Reaches agents whose session predates set_status (or who skipped the guide). */
@@ -102,20 +102,51 @@ function err(message: string) {
   return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true }
 }
 
-/** Reaches agents that start designing without having read the canvas's style guides. */
+/** Who reads a canvas's guidelines: an agent, identified across canvases
+ *  (the connected account plus its agent_name), and whether the account
+ *  has durable access to the canvas — the workspace's docs need it. */
+interface GuidelineReader {
+  agent: string
+  workspace: boolean
+}
+
+/** Reaches agents that start designing without having read the canvas's
+ *  guidelines. The workspace's rules come in full — get_guide does not carry
+ *  them — and count as read once delivered; the instance's rules are never
+ *  repeated here, get_guide already delivered them. */
 function withGuidelinesNudge<T extends { content: { type: 'text' | 'image'; [k: string]: unknown }[] }>(
   result: T,
   canvasId: string,
-  actor?: Actor,
+  reader: GuidelineReader,
 ): T {
-  if (!actor) return result
-  const unread = actions.unreadGuidelines(canvasId, actor.name)
+  const unread = actions.unreadGuidelines(canvasId, reader.agent, reader.workspace)
   if (unread.length === 0) return result
-  result.content.push({
-    type: 'text' as const,
-    text: `This canvas has style guides you have not read: ${unread.map(docLabel).join(', ')}. Call get_guidelines({ canvas_id, name }) for each relevant one NOW and make your design follow them.`,
-  })
+  const rules = unread.filter((d) => d.scope === 'workspace' && d.kind === 'instructions')
+  const rest = unread.filter((d) => !rules.includes(d))
+  const style = rest.filter((d) => d.kind === 'style')
+  const notes = rest.filter((d) => d.kind === 'instructions')
+  const lines = [
+    ...(style.length
+      ? [
+          `This canvas has style guides you have not read: ${style.map(docLabel).join(', ')}. Call get_guidelines({ canvas_id, name }) for each relevant one NOW and make your design follow them.`,
+        ]
+      : []),
+    ...(notes.length
+      ? [
+          `This canvas has notes from its editors you have not read: ${notes.map(docLabel).join(', ')}. Read them with get_guidelines({ canvas_id, name }).`,
+        ]
+      : []),
+    ...(rules.length ? [workspaceRulesFor(canvasId, rules)] : []),
+  ]
+  if (rules.length) actions.markGuidelinesSeen(canvasId, reader.agent, reader.workspace, rules)
+  result.content.push({ type: 'text' as const, text: lines.join('\n\n') })
   return result
+}
+
+/** The rules of a canvas's workspace, rendered for delivery on that canvas. */
+function workspaceRulesFor(canvasId: string, docs: ScopedGuidelineDoc[]): string {
+  const workspaceId = store.getCanvas(canvasId)?.workspaceId ?? ''
+  return workspaceRules(workspaces.getWorkspace(workspaceId)?.name ?? workspaceId, docs)
 }
 
 /** A doc's name, with the scope it comes from when the canvas inherits it. */
@@ -134,18 +165,6 @@ function guidelineSummary(doc: ScopedGuidelineDoc) {
     summary: actions.guidelineSummary(doc),
     bytes: doc.markdown.length,
   }
-}
-
-/** The organisation rules a user is subject to: the install's, and those of
- *  every workspace they belong to. */
-function ruleSourcesFor(userId?: string): RuleSource[] {
-  return [
-    { label: 'instance', docs: store.getScopedGuidelines('instance', actions.INSTANCE_SCOPE_ID) },
-    ...(userId ? workspaces.workspaceIdsFor(userId) : []).map((id) => ({
-      label: `workspace "${workspaces.getWorkspace(id)?.name ?? id}"`,
-      docs: store.getScopedGuidelines('workspace', id),
-    })),
-  ]
 }
 
 /** The initialize instructions, plus the names of the install's own working
@@ -279,29 +298,19 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
   const noCanvas = (id: string) => err(`no canvas with id ${id} accessible to this account`)
   const noFrame = (id: string) => err(`no frame with id ${id} accessible to this account`)
   const noComment = (id: string) => err(`no comment with id ${id} on this canvas`)
-  /* Where set_guidelines writes: null = the canvas itself, a string = why
-     this user may not write there. The connected user, not the agent, is
-     who the permission is checked against. */
-  const guidelineTarget = async (
-    scope: GuidelineScope,
-    workspaceId: string | undefined,
-  ): Promise<{ scope: 'workspace' | 'instance'; scopeId: string } | null | string> => {
-    if (scope === 'canvas') return null
-    if (scope === 'workspace') {
-      if (!workspaceId) return 'this canvas is not in a workspace — use scope "canvas" or "instance"'
-      if (!workspaces.hasRole(workspaceId, ownerId, 'admin'))
-        return 'only a workspace admin can change the workspace\'s guidelines — ask one, or use scope "canvas"'
-      return { scope, scopeId: workspaceId }
-    }
-    if (!ownerId || !(await isAdminUser(ownerId)))
-      return 'only an instance admin can change the guidelines of the whole install — use scope "canvas"'
-    return { scope, scopeId: actions.INSTANCE_SCOPE_ID }
-  }
   /* Reads count as arrival: presence (and with it every "your agent is
      connected" confirmation in the UI) must appear on an agent's FIRST
      canvas-scoped call, not only once it mutates something. */
   const arrive = (canvasId: string, agent_name?: string) => {
     if (agent_name) actions.heartbeatAgent(canvasId, actorFrom(agent_name))
+  }
+  /* An agent reading a canvas's guidelines: see GuidelineReader. */
+  const readerOf = (canvasId: string, agent_name?: string): GuidelineReader => {
+    const c = store.getCanvas(canvasId)
+    return {
+      agent: `${ownerId ?? ''}/${actorFrom(agent_name).name}`,
+      workspace: !!c && hasDurableCanvasAccess(ownerId, c),
+    }
   }
   const server = new McpServer({ name: 'doop-canvas', version: '0.1.0' }, { instructions: instructionsFor() })
   registerFramePreview(server)
@@ -318,7 +327,11 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       },
     },
     async () => {
-      const rules = organisationRules(ruleSourcesFor(ownerId))
+      /* the install's rules only: a workspace's reach an agent on that
+         workspace's canvases (get_canvas, the nudge), never elsewhere */
+      const rules = organisationRules([
+        { label: 'instance', docs: store.getScopedGuidelines('instance', actions.INSTANCE_SCOPE_ID) },
+      ])
       return text(rules ? `${DOOP_GUIDE}\n${rules}` : DOOP_GUIDE)
     },
   )
@@ -391,7 +404,8 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
             : {}),
           /* count what get_canvas will actually return — demo frames are hidden from agents */
           frameCount: store.getCanvas(m.id)?.frames.filter((f) => !f.demo).length ?? m.frameCount,
-          guidelinesCount: actions.effectiveGuidelines(m.id).length,
+          /* the canvas's own docs; get_canvas lists the inherited ones too */
+          guidelinesCount: store.getGuidelines(m.id).length,
         })),
       ),
   )
@@ -457,7 +471,10 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
       arrive(canvas_id, agent_name)
-      const docs = actions.effectiveGuidelines(canvas_id)
+      const reader = readerOf(canvas_id, agent_name)
+      const docs = actions.effectiveGuidelines(canvas_id, reader.workspace)
+      /* the workspace's rules ride along in full: get_guide does not carry them */
+      const rules = docs.filter((d) => d.scope === 'workspace' && d.kind === 'instructions')
       const refs = store.getReferences(canvas_id)
       /* design-synced canvases carry a flow map: real user navigation between
          the synced screens — context a redesign must respect */
@@ -468,7 +485,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
               'This canvas is synced from a live app and `flow` shows how its screens connect — including how often real users take each path. Do not bury or weaken elements that carry heavy navigation.',
             ]
           : []),
-        ...(docs.length
+        ...(docs.some((d) => d.kind === 'style')
           ? [
               'This canvas has style guides. Call get_guidelines for each relevant one BEFORE designing — every frame must follow them.',
             ]
@@ -479,7 +496,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
             ]
           : []),
       ]
-      return withPreview(
+      const result = withPreview(
         withFeedback(
           text({
             id: c.id,
@@ -506,6 +523,11 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         canvas_id,
         c.frames.filter((f) => !f.demo),
       )
+      if (rules.length) {
+        result.content.push({ type: 'text' as const, text: workspaceRulesFor(canvas_id, rules) })
+        if (agent_name) actions.markGuidelinesSeen(canvas_id, reader.agent, reader.workspace, rules)
+      }
+      return result
     },
   )
 
@@ -520,8 +542,9 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     },
     async ({ canvas_id, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
-      if (agent_name) actions.markGuidelinesSeen(canvas_id, actorFrom(agent_name).name)
-      const docs = actions.effectiveGuidelines(canvas_id)
+      const reader = readerOf(canvas_id, agent_name)
+      if (agent_name) actions.markGuidelinesSeen(canvas_id, reader.agent, reader.workspace)
+      const docs = actions.effectiveGuidelines(canvas_id, reader.workspace)
       if (docs.length === 0)
         return text({
           guidelines: [],
@@ -556,7 +579,8 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     },
     async ({ canvas_id, name, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
-      const docs = actions.effectiveGuidelines(canvas_id)
+      const reader = readerOf(canvas_id, agent_name)
+      const docs = actions.effectiveGuidelines(canvas_id, reader.workspace)
       const doc = docs.find((d) => d.name === name.trim().toLowerCase())
       if (!doc) {
         return err(
@@ -565,14 +589,14 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
             : `no style guides on this canvas yet`,
         )
       }
-      if (agent_name) actions.markGuidelinesSeen(canvas_id, actorFrom(agent_name).name)
+      if (agent_name) actions.markGuidelinesSeen(canvas_id, reader.agent, reader.workspace)
       const result = text(doc.markdown)
       result.content.push({
         type: 'text' as const,
         text:
           doc.scope === 'canvas'
             ? `(scope: canvas — kind: ${doc.kind})`
-            : `(scope: ${doc.scope}, inherited by this canvas — kind: ${doc.kind}. Only a ${doc.scope === 'workspace' ? 'workspace admin' : 'instance admin'} can change it; a canvas doc with the same name overrides it here.)`,
+            : `(scope: ${doc.scope}, inherited by this canvas — kind: ${doc.kind}. Only a ${doc.scope === 'workspace' ? 'workspace admin' : 'instance admin'} can change it, in Doop's settings${doc.kind === 'style' ? '; a canvas doc with the same name overrides it here' : ''}.)`,
       })
       return withFeedback(result, canvas_id, agent_name ? actorFrom(agent_name) : undefined)
     },
@@ -583,7 +607,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     {
       title: 'Create or replace a style guide',
       description:
-        "Create, replace or delete a named style guide on a canvas (markdown, max 24,000 chars; empty string deletes). Write rules other designers and agents can execute directly: palette hexes, font <link>s, ready-to-paste <style> blocks, logo asset URLs (upload files with upload_asset first and reference the returned URLs), layout recipes, do/don't lists. scope 'workspace' writes to the canvas's workspace (workspace admins only) and 'instance' to the whole install (instance admins only) — every canvas below inherits it; only do that when a human asks for an organisation-wide rule.",
+        "Create, replace or delete a named style guide on a canvas (markdown, max 24,000 chars; empty string deletes). Write rules other designers and agents can execute directly: palette hexes, font <link>s, ready-to-paste <style> blocks, logo asset URLs (upload files with upload_asset first and reference the returned URLs), layout recipes, do/don't lists. Writes this canvas's own docs only: a workspace's or the install's rules are set by a person in Doop's settings, never by an agent.",
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       inputSchema: {
         canvas_id: z.string(),
@@ -600,7 +624,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         scope: z
           .enum(GUIDELINE_SCOPES)
           .optional()
-          .describe("Where the doc lives: 'canvas' (default), 'workspace' (the canvas's workspace) or 'instance'"),
+          .describe("Only 'canvas' (the default) is accepted: workspace and instance rules are set by a person"),
         kind: z
           .enum(GUIDELINE_KINDS)
           .optional()
@@ -611,16 +635,19 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       },
     },
     async ({ canvas_id, name, markdown, title, scope, kind, agent_name }) => {
-      const canvas = canvasFor(canvas_id)
-      if (!canvas) return noCanvas(canvas_id)
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      /* An agent never writes above its canvas: a prompt-injected session
+         holding an admin's token or agent key could otherwise plant
+         instructions in every agent on the install. */
+      if (scope && scope !== 'canvas')
+        return err(
+          `agents cannot set ${scope} rules — a person sets them in Doop (${scope === 'workspace' ? 'the workspace settings, Rules' : 'Admin, Rules'}) or over its REST API. Use scope "canvas" for this canvas's own docs.`,
+        )
       const actor = actorFrom(agent_name)
       try {
-        const target = await guidelineTarget(scope ?? 'canvas', canvas.workspaceId)
-        if (typeof target === 'string') return err(target)
-        const doc = target
-          ? actions.setScopedGuideline(target.scope, target.scopeId, name, markdown, actor, title, kind)
-          : actions.setGuideline(canvas_id, name, markdown, actor, undefined, title, kind)
-        actions.markGuidelinesSeen(canvas_id, actor.name)
+        const doc = actions.setGuideline(canvas_id, name, markdown, actor, undefined, title, kind)
+        const reader = readerOf(canvas_id, agent_name)
+        actions.markGuidelinesSeen(canvas_id, reader.agent, reader.workspace)
         return withFeedback(
           text(
             doc
@@ -628,7 +655,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
                   ok: true,
                   name: doc.name,
                   title: actions.guidelineTitle(doc),
-                  scope: scope ?? 'canvas',
+                  scope: 'canvas',
                   kind: doc.kind,
                   bytes: doc.markdown.length,
                 }
@@ -960,7 +987,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       return withGuidelinesNudge(
         withStatusNudge(withFeedback(result, canvas_id, actorFrom(agent_name)), canvas_id, actorFrom(agent_name)),
         canvas_id,
-        actorFrom(agent_name),
+        readerOf(canvas_id, agent_name),
       )
     },
   )
@@ -1011,7 +1038,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
             actorFrom(agent_name),
           ),
           frame.canvasId,
-          actorFrom(agent_name),
+          readerOf(frame.canvasId, agent_name),
         ),
         frame.canvasId,
         [frame],
@@ -1618,7 +1645,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       /* nudge only on the first chunk — mid-stream results should stay lean.
          The escape check rides along: the opening chunk decides the stream. */
       const nudged = start
-        ? withGuidelinesNudge(withEscapeNote(result, html_chunk), frame.canvasId, actorFrom(agent_name))
+        ? withGuidelinesNudge(withEscapeNote(result, html_chunk), frame.canvasId, readerOf(frame.canvasId, agent_name))
         : result
       return withStatusNudge(
         withFeedback(nudged, frame.canvasId, actorFrom(agent_name)),

@@ -42,7 +42,13 @@ import type {
  * appends to the canvas activity log and broadcasts to the ws room.
  */
 
-type Broadcast = (canvasId: string, msg: ServerMessage, excludeClientId?: string) => void
+type Broadcast = (
+  canvasId: string,
+  msg: ServerMessage,
+  excludeClientId?: string,
+  /* durableOnly: skip viewers who are in on a share link alone */
+  opts?: { durableOnly?: boolean },
+) => void
 type AgentTouch = (
   canvasId: string,
   agentName: string,
@@ -1464,6 +1470,8 @@ export function setGuideline(
     return null
   }
 
+  if (inheritedGuidelines(canvasId, true).some((d) => d.name === slug && d.kind === 'instructions'))
+    throw new Error(`“${slug}” is the name of an organisation rule this canvas follows — pick another name`)
   const existing = store.getGuidelines(canvasId)
   if (!existing.some((d) => d.name === slug) && existing.length >= MAX_GUIDELINE_DOCS)
     throw new Error(`this canvas already has ${MAX_GUIDELINE_DOCS} design guides — delete one first`)
@@ -1502,6 +1510,11 @@ export function setScopedGuideline(
     return null
   }
 
+  if (
+    scope === 'workspace' &&
+    store.getScopedGuidelines('instance', INSTANCE_SCOPE_ID).some((d) => d.name === slug && d.kind === 'instructions')
+  )
+    throw new Error(`“${slug}” is the name of an instance rule — pick another name`)
   const existing = store.getScopedGuidelines(scope, scopeId)
   if (!existing.some((d) => d.name === slug) && existing.length >= MAX_GUIDELINE_DOCS)
     throw new Error(`this ${scope} already has ${MAX_GUIDELINE_DOCS} guidelines — delete one first`)
@@ -1511,28 +1524,34 @@ export function setScopedGuideline(
   return doc
 }
 
-/** Tell every canvas below a scope: the workspace's canvases, or all of them. */
+/** Tell every canvas below a scope: the workspace's canvases (only to
+ *  viewers with durable access — see inheritedGuidelines), or all of them. */
 function broadcastScoped(scope: InheritedScope, scopeId: string, msg: ServerMessage) {
   for (const c of store.canvases.values()) {
-    if (scope === 'instance' || c.workspaceId === scopeId) broadcast(c.id, msg)
+    if (scope === 'instance') broadcast(c.id, msg)
+    else if (c.workspaceId === scopeId) broadcast(c.id, msg, undefined, { durableOnly: true })
   }
 }
 
-/** The workspace and instance docs a canvas inherits, unmerged. */
-export function inheritedGuidelines(canvasId: string): ScopedGuidelineDoc[] {
+/** The workspace and instance docs a canvas inherits, unmerged. The
+ *  workspace's are the members' business: pass `withWorkspace` only for a
+ *  reader with durable access to the canvas (hasDurableCanvasAccess) — a
+ *  share-link visitor gets the instance's and the canvas's own. */
+export function inheritedGuidelines(canvasId: string, withWorkspace: boolean): ScopedGuidelineDoc[] {
   const workspaceId = store.getCanvas(canvasId)?.workspaceId
   return [
     ...store.getScopedGuidelines('instance', INSTANCE_SCOPE_ID).map((d) => ({ ...d, scope: 'instance' as const })),
-    ...(workspaceId
+    ...(workspaceId && withWorkspace
       ? store.getScopedGuidelines('workspace', workspaceId).map((d) => ({ ...d, scope: 'workspace' as const }))
       : []),
   ]
 }
 
 /** Every doc a canvas follows: instance, then its workspace, then its own,
- *  merged by name with the nearest scope winning. */
-export function effectiveGuidelines(canvasId: string): ScopedGuidelineDoc[] {
-  const inherited = inheritedGuidelines(canvasId)
+ *  merged by name — the nearest style doc wins, an organisation rule
+ *  (instructions) is never shadowed. `withWorkspace` as for inheritedGuidelines. */
+export function effectiveGuidelines(canvasId: string, withWorkspace: boolean): ScopedGuidelineDoc[] {
+  const inherited = inheritedGuidelines(canvasId, withWorkspace)
   return mergeGuidelines([
     inherited.filter((d) => d.scope === 'instance'),
     inherited.filter((d) => d.scope === 'workspace'),
@@ -1564,28 +1583,41 @@ export function patchGuideline(
   return true
 }
 
-/* Per-process memory of which of a canvas's docs each agent has read, by
-   scope and name: a doc that appears later — a new workspace rule, or the
-   canvas moving into a workspace — is unread again. Worst case after a
-   restart is one extra nudge, same trade-off as the task log's announce
-   tracking. */
+/* Per-process memory of which docs each agent has read, keyed by doc: a
+   workspace or instance doc read on one canvas is read on all of them; a
+   canvas doc is read per canvas. A doc that appears later — a new
+   workspace rule, the canvas moving into a workspace — is unread. Worst
+   case after a restart is one extra nudge, same trade-off as the task
+   log's announce tracking. `agent` identifies the agent across canvases
+   (MCP: the connected account plus the agent_name). */
 const guidelinesSeen = new Map<string, Set<string>>()
 
-const seenKey = (doc: ScopedGuidelineDoc) => `${doc.scope}:${doc.name}`
-
-/** Reading the list, or any doc, counts as having read every doc the canvas
- *  follows right now — the agent picks the relevant ones itself. */
-export function markGuidelinesSeen(canvasId: string, agentName: string) {
-  const key = `${canvasId}:${agentName}`
-  const seen = guidelinesSeen.get(key) ?? new Set<string>()
-  for (const doc of effectiveGuidelines(canvasId)) seen.add(seenKey(doc))
-  guidelinesSeen.set(key, seen)
+function docKey(canvasId: string, doc: ScopedGuidelineDoc): string {
+  if (doc.scope === 'canvas') return `canvas:${canvasId}:${doc.name}`
+  if (doc.scope === 'workspace') return `workspace:${store.getCanvas(canvasId)?.workspaceId ?? ''}:${doc.name}`
+  return `instance::${doc.name}`
 }
 
-/** The docs this canvas follows that the agent has not seen yet. */
-export function unreadGuidelines(canvasId: string, agentName: string): ScopedGuidelineDoc[] {
-  const seen = guidelinesSeen.get(`${canvasId}:${agentName}`)
-  return effectiveGuidelines(canvasId).filter((doc) => !seen?.has(seenKey(doc)))
+/** Mark docs read; with no `docs`, every doc the canvas follows right now —
+ *  reading the list or any doc counts, the agent picks the relevant ones. */
+export function markGuidelinesSeen(
+  canvasId: string,
+  agent: string,
+  withWorkspace: boolean,
+  docs: ScopedGuidelineDoc[] = effectiveGuidelines(canvasId, withWorkspace),
+) {
+  const seen = guidelinesSeen.get(agent) ?? new Set<string>()
+  for (const doc of docs) seen.add(docKey(canvasId, doc))
+  guidelinesSeen.set(agent, seen)
+}
+
+/** The docs this canvas follows that the agent has not seen yet — minus the
+ *  instance's rules, which get_guide hands every agent up front. */
+export function unreadGuidelines(canvasId: string, agent: string, withWorkspace: boolean): ScopedGuidelineDoc[] {
+  const seen = guidelinesSeen.get(agent)
+  return effectiveGuidelines(canvasId, withWorkspace).filter(
+    (doc) => !(doc.scope === 'instance' && doc.kind === 'instructions') && !seen?.has(docKey(canvasId, doc)),
+  )
 }
 
 /* ------------------------------------------------------------------ */

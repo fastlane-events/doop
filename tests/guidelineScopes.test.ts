@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as actions from '../server/actions.ts'
-import { organisationRules } from '../server/guide.ts'
+import { canvasNotes, organisationRules, workspaceRules } from '../server/guide.ts'
 import { store } from '../server/store.ts'
 import { mergeGuidelines } from '../shared/types.ts'
 import type { Actor, Canvas, GuidelineDoc } from '../shared/types.ts'
@@ -18,6 +18,7 @@ vi.mock('../server/db/persist.ts', () => ({
 }))
 
 const actor: Actor = { name: 'Ada', kind: 'user', color: '#000' }
+const INSTANCE = actions.INSTANCE_SCOPE_ID
 
 function canvas(id: string, workspaceId?: string): Canvas {
   return {
@@ -39,22 +40,24 @@ const doc = (name: string, markdown: string, kind: GuidelineDoc['kind'] = 'style
   updatedBy: 'Ada',
 })
 
+const names = (docs: { name: string; scope: string }[]) => docs.map((d) => `${d.name}:${d.scope}`)
+
 beforeEach(() => {
   store.canvases.clear()
   store.initScopedGuidelines([])
-  store.init([canvas('team', 'ws1'), canvas('solo')])
+  store.init([canvas('team', 'ws1'), canvas('team2', 'ws1'), canvas('other', 'ws2'), canvas('solo')])
 })
 
 describe('guideline scopes', () => {
-  it('merges instance, workspace and canvas docs by name, nearest scope winning', () => {
-    actions.setScopedGuideline('instance', actions.INSTANCE_SCOPE_ID, 'brand', '# Instance brand', actor)
-    actions.setScopedGuideline('instance', actions.INSTANCE_SCOPE_ID, 'voice', '# Instance voice', actor)
-    actions.setScopedGuideline('instance', actions.INSTANCE_SCOPE_ID, 'grid', '# Instance grid', actor)
+  it('merges style docs by name, nearest scope winning', () => {
+    actions.setScopedGuideline('instance', INSTANCE, 'brand', '# Instance brand', actor)
+    actions.setScopedGuideline('instance', INSTANCE, 'voice', '# Instance voice', actor)
+    actions.setScopedGuideline('instance', INSTANCE, 'grid', '# Instance grid', actor)
     actions.setScopedGuideline('workspace', 'ws1', 'brand', '# Workspace brand', actor)
     actions.setScopedGuideline('workspace', 'ws1', 'voice', '# Workspace voice', actor)
     actions.setGuideline('team', 'voice', '# Canvas voice', actor)
 
-    const team = actions.effectiveGuidelines('team').map((d) => `${d.name}:${d.scope}:${d.markdown}`)
+    const team = actions.effectiveGuidelines('team', true).map((d) => `${d.name}:${d.scope}:${d.markdown}`)
     expect(team).toEqual([
       'brand:workspace:# Workspace brand',
       'grid:instance:# Instance grid',
@@ -62,14 +65,34 @@ describe('guideline scopes', () => {
     ])
   })
 
-  it('gives a personal canvas the instance docs and its own, never a workspace’s', () => {
-    actions.setScopedGuideline('instance', actions.INSTANCE_SCOPE_ID, 'brand', '# Instance brand', actor)
+  it('never lets a nearer scope shadow an organisation rule', () => {
+    actions.setScopedGuideline('instance', INSTANCE, 'alt-text', '# Alt', actor, undefined, 'instructions')
+    actions.setScopedGuideline('workspace', 'ws1', 'tone', '# Tone', actor, undefined, 'instructions')
+    /* refused on write, from every path that writes a canvas doc */
+    expect(() => actions.setGuideline('team', 'alt-text', '# Mine', actor)).toThrow(/organisation rule/)
+    expect(() => actions.setGuideline('team', 'tone', '# Mine', actor)).toThrow(/organisation rule/)
+    expect(() => actions.setScopedGuideline('workspace', 'ws1', 'alt-text', '# Mine', actor)).toThrow(/instance rule/)
+    /* a canvas outside the workspace may use the workspace rule's name */
+    expect(actions.setGuideline('other', 'tone', '# Other tone', actor)?.name).toBe('tone')
+    /* and a doc that predates the rule cannot shadow it in the merge */
+    store.setGuideline('team', 'alt-text', '# Legacy', 'Ada')
+    expect(actions.effectiveGuidelines('team', true).find((d) => d.name === 'alt-text')).toMatchObject({
+      scope: 'instance',
+      markdown: '# Alt',
+    })
+  })
+
+  it('keeps the workspace’s docs from readers without durable access, and from personal canvases', () => {
+    actions.setScopedGuideline('instance', INSTANCE, 'brand', '# Instance brand', actor)
     actions.setScopedGuideline('workspace', 'ws1', 'tone', '# Workspace tone', actor)
-    actions.setGuideline('solo', 'layout', '# Solo layout', actor)
-    expect(actions.effectiveGuidelines('solo').map((d) => `${d.name}:${d.scope}`)).toEqual([
+    actions.setGuideline('team', 'layout', '# Layout', actor)
+    expect(names(actions.effectiveGuidelines('team', true))).toEqual([
       'brand:instance',
       'layout:canvas',
+      'tone:workspace',
     ])
+    expect(names(actions.effectiveGuidelines('team', false))).toEqual(['brand:instance', 'layout:canvas'])
+    expect(names(actions.effectiveGuidelines('solo', true))).toEqual(['brand:instance'])
   })
 
   it('defaults a new doc to style and keeps the kind when an update omits it', () => {
@@ -79,18 +102,25 @@ describe('guideline scopes', () => {
     expect(actions.setGuideline('team', 'look', '# Look', actor)?.kind).toBe('style')
   })
 
-  it('treats inherited docs as unread until the agent reads the canvas’s docs', () => {
-    actions.setGuideline('team', 'look', '# Look', actor)
-    actions.markGuidelinesSeen('team', 'Claude')
-    expect(actions.unreadGuidelines('team', 'Claude')).toEqual([])
-
+  it('tracks read inherited docs per agent across canvases, canvas docs per canvas', () => {
     actions.setScopedGuideline('workspace', 'ws1', 'tone', '# Tone', actor)
-    expect(actions.unreadGuidelines('team', 'Claude').map((d) => `${d.scope}:${d.name}`)).toEqual(['workspace:tone'])
+    actions.setGuideline('team', 'look', '# Look', actor)
+    actions.setGuideline('team2', 'look', '# Look 2', actor)
+    actions.markGuidelinesSeen('team', 'u1/Claude', true)
+    expect(actions.unreadGuidelines('team', 'u1/Claude', true)).toEqual([])
+    /* the workspace doc was read on team; team2's own doc was not */
+    expect(names(actions.unreadGuidelines('team2', 'u1/Claude', true))).toEqual(['look:canvas'])
     /* another agent has read nothing */
-    expect(actions.unreadGuidelines('team', 'Codex')).toHaveLength(2)
+    expect(actions.unreadGuidelines('team', 'u2/Claude', true)).toHaveLength(2)
+    /* a doc that appears later is unread */
+    actions.setScopedGuideline('workspace', 'ws1', 'spacing', '# Spacing', actor)
+    expect(names(actions.unreadGuidelines('team', 'u1/Claude', true))).toEqual(['spacing:workspace'])
+  })
 
-    actions.markGuidelinesSeen('team', 'Claude')
-    expect(actions.unreadGuidelines('team', 'Claude')).toEqual([])
+  it('leaves the instance’s rules out of the unread set — get_guide delivers them', () => {
+    actions.setScopedGuideline('instance', INSTANCE, 'alt-text', '# Alt', actor, undefined, 'instructions')
+    actions.setScopedGuideline('instance', INSTANCE, 'brand', '# Brand', actor)
+    expect(names(actions.unreadGuidelines('team', 'u1/Claude', true))).toEqual(['brand:instance'])
   })
 
   it('validates scoped docs like canvas docs and deletes them with empty markdown', () => {
@@ -111,7 +141,7 @@ describe('guideline scopes', () => {
   })
 })
 
-describe('organisationRules', () => {
+describe('rule rendering', () => {
   it('renders only instructions docs, each headed with its name and scope', () => {
     const rules = organisationRules([
       { label: 'instance', docs: [doc('alt-text', 'Describe images.', 'instructions'), doc('brand', 'Blue.')] },
@@ -125,5 +155,17 @@ describe('organisationRules', () => {
 
   it('is empty when there are no instructions docs', () => {
     expect(organisationRules([{ label: 'instance', docs: [doc('brand', 'Blue.')] }])).toBe('')
+    expect(workspaceRules('Acme', [doc('brand', 'Blue.')])).toBe('')
+    expect(canvasNotes([])).toBe('')
+  })
+
+  it('says where a workspace’s rules apply, and keeps canvas notes apart from the organisation’s', () => {
+    expect(workspaceRules('Acme', [doc('tone', 'Warm.', 'instructions')])).toContain(
+      'These apply on canvases of workspace "Acme"',
+    )
+    const notes = canvasNotes([doc('handoff', 'Ping Sam.', 'instructions')])
+    expect(notes).toContain('## Notes left on this canvas by its editors')
+    expect(notes).not.toContain("organisation's rules\n")
+    expect(notes).toContain('Ping Sam.')
   })
 })
