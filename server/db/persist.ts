@@ -31,8 +31,26 @@ import type {
  * Nothing on the live path (presence, cursors, reveal ticks) awaits the DB.
  */
 
+/* writes in flight and how many failed, for drain() */
+const inFlight = new Set<Promise<unknown>>()
+let failedWrites = 0
+
 function swallow(p: Promise<unknown>) {
-  p.catch((err) => console.error('[db] write failed', err))
+  const write: Promise<unknown> = p
+    .catch((err) => {
+      failedWrites++
+      console.error('[db] write failed', err)
+    })
+    .finally(() => inFlight.delete(write))
+  inFlight.add(write)
+}
+
+/** Wait until every write issued so far has landed; resolves to how many
+ *  writes have failed. For one-shot processes (scripts/set-guideline.ts)
+ *  that must not exit mid-write — the server itself never waits. */
+export async function drain(): Promise<number> {
+  while (inFlight.size) await Promise.all([...inFlight])
+  return failedWrites
 }
 
 /** every mutable canvas column, so insert and upsert can't drift apart */
@@ -703,6 +721,35 @@ const LOG_CAP = 100
 /** the chat keeps more history than the other logs — it is the conversation */
 export const CHAT_LOG_CAP = 300
 
+type ScopedGuidelineRow = typeof t.scopedGuidelines.$inferSelect
+
+function toScopedGuidelines(rows: ScopedGuidelineRow[]): Hydrated['scopedGuidelines'] {
+  return rows.flatMap((g) =>
+    g.scopeType === 'workspace' || g.scopeType === 'instance'
+      ? [
+          {
+            scope: g.scopeType as InheritedScope,
+            scopeId: g.scopeId,
+            doc: {
+              name: g.name,
+              markdown: g.markdown,
+              ...(g.title != null ? { title: g.title } : {}),
+              kind: isGuidelineKind(g.kind) ? g.kind : 'style',
+              updatedAt: g.updatedAt,
+              updatedBy: g.updatedBy,
+            },
+          },
+        ]
+      : [],
+  )
+}
+
+/** The workspace and instance docs alone — for a process that needs them
+ *  without the rest of hydrate() (scripts/set-guideline.ts). */
+export async function loadScopedGuidelines(): Promise<Hydrated['scopedGuidelines']> {
+  return toScopedGuidelines(await db.select().from(t.scopedGuidelines).orderBy(t.scopedGuidelines.name))
+}
+
 export async function hydrate(): Promise<Hydrated> {
   const [
     canvasRows,
@@ -968,24 +1015,7 @@ export async function hydrate(): Promise<Hydrated> {
     proposals.set(row.canvasId, list)
   }
 
-  const scopedGuidelines = scopedGuidelineRows.flatMap((g) =>
-    g.scopeType === 'workspace' || g.scopeType === 'instance'
-      ? [
-          {
-            scope: g.scopeType as InheritedScope,
-            scopeId: g.scopeId,
-            doc: {
-              name: g.name,
-              markdown: g.markdown,
-              ...(g.title != null ? { title: g.title } : {}),
-              kind: isGuidelineKind(g.kind) ? g.kind : 'style',
-              updatedAt: g.updatedAt,
-              updatedBy: g.updatedBy,
-            },
-          },
-        ]
-      : [],
-  )
+  const scopedGuidelines = toScopedGuidelines(scopedGuidelineRows)
 
   return { canvases, tasks, feedback, comments, chat, activity, decisions, proposals, scopedGuidelines }
 }
