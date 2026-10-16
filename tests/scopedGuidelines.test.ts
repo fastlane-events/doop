@@ -201,6 +201,18 @@ describe('scoped guidelines', () => {
     expect((await overInstance.json()).error).toContain('instance rule')
   })
 
+  it('tells the admin which canvases a new rule hides a doc on', async () => {
+    expect((await put(mate, `/api/canvases/${canvasId}/guidelines/legacy`, { markdown: '# Old' })).status).toBe(200)
+    const saved = await put(owner, `/api/workspaces/${workspaceId}/guidelines/legacy`, {
+      markdown: '# Legacy rule',
+      kind: 'instructions',
+    })
+    expect((await saved.json()).hidden).toEqual([{ id: canvasId, name: 'Launch' }])
+    /* the hidden doc can still be deleted */
+    expect((await put(mate, `/api/canvases/${canvasId}/guidelines/legacy`, { markdown: '' })).status).toBe(200)
+    expect((await put(owner, `/api/workspaces/${workspaceId}/guidelines/legacy`, { markdown: '' })).status).toBe(200)
+  })
+
   it('resolves a name nearest-scope-first and says which scope served it', async () => {
     const inherited = await callTool(mateKey, 'get_guidelines', { canvas_id: canvasId, name: 'brand' })
     expect(textOf(inherited)).toContain('Use ink blue.')
@@ -252,6 +264,12 @@ describe('scoped guidelines', () => {
     const tone = await callTool(strangerKey, 'get_guidelines', { canvas_id: canvasId, name: 'tone' })
     expect(tone.isError).toBe(true)
     expect(textOf(tone)).not.toContain('Warm.')
+    /* a refused name does not tell a link visitor it is a workspace rule */
+    const taken = await put(stranger, `/api/canvases/${canvasId}/guidelines/tone`, { markdown: '# Mine' })
+    expect(taken.status).toBe(400)
+    const { error } = await taken.json()
+    expect(error).toContain('cannot be used for a doc on this canvas')
+    expect(error).not.toContain('organisation')
     /* members still get them */
     const member = await (await mate.get(`/api/canvases/${canvasId}`)).json()
     expect(member.inheritedGuidelines.map((d: { scope: string }) => d.scope)).toContain('workspace')

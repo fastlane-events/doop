@@ -82,6 +82,34 @@ describe('set-guideline CLI', () => {
     expect(history).toMatchObject([{ markdown: '# Brand\n\nInk blue.', savedBy: 'cli' }])
   }, 70_000)
 
+  it('warns which canvases a rule hides a doc on', async () => {
+    expect(
+      (
+        await owner.req(`/api/canvases/${canvasId}/guidelines/legacy`, {
+          method: 'PUT',
+          body: JSON.stringify({ markdown: '# Old' }),
+        })
+      ).status,
+    ).toBe(200)
+    await stop()
+    const res = await cli(
+      '--scope',
+      'workspace',
+      '--workspace',
+      workspaceId,
+      '--name',
+      'legacy',
+      '--kind',
+      'instructions',
+      '--file',
+      file('legacy.md', '# Legacy rule'),
+    )
+    expect(res.code, res.out).toBe(0)
+    expect(res.out).toContain(`warning: this rule hides the canvas doc "legacy" on 1 canvas(es): Launch (${canvasId})`)
+    expect((await cli('--scope', 'workspace', '--workspace', workspaceId, '--name', 'legacy', '--delete')).code).toBe(0)
+    await restart()
+  }, 70_000)
+
   it('refuses bad input without writing anything', async () => {
     await stop()
     const md = file('x.md', '# X')

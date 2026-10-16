@@ -15,7 +15,10 @@ vi.mock('../server/db/persist.ts', () => ({
   saveScopedGuidelineVersion: () => {},
   deleteScopedGuideline: () => {},
   saveActivity: () => {},
+  saveProposal: () => {},
 }))
+/* the resident module pulls in model clients; only its prompt builder is under test */
+const { guidelineBlocks } = await import('../server/resident.ts')
 
 const actor: Actor = { name: 'Ada', kind: 'user', color: '#000' }
 const INSTANCE = actions.INSTANCE_SCOPE_ID
@@ -138,6 +141,60 @@ describe('guideline scopes', () => {
       [{ ...doc('a', 'canvas'), scope: 'canvas' }],
     ])
     expect(merged).toMatchObject([{ name: 'a', markdown: 'canvas', scope: 'canvas' }])
+  })
+})
+
+describe('organisation rules around the canvas', () => {
+  it('gives a resident run the workspace’s docs whoever asked for it', () => {
+    actions.setScopedGuideline('workspace', 'ws1', 'tone', '# Tone\n\nWarm.', actor, undefined, 'instructions')
+    actions.setScopedGuideline('workspace', 'ws1', 'brand', '# Brand\n\nInk blue.', actor)
+    actions.setGuideline('team', 'handoff', '# Handoff\n\nPing Sam.', actor, undefined, undefined, 'instructions')
+    const [block] = guidelineBlocks('team')
+    expect(block?.text).toContain('Ink blue.')
+    expect(block?.text).toContain("## Your organisation's rules")
+    expect(block?.text).toContain('(tone, workspace "ws1" scope)')
+    /* the canvas's own instructions come last, as notes */
+    expect(block!.text.indexOf('## Notes left on this canvas by its editors')).toBeGreaterThan(
+      block!.text.indexOf('Warm.'),
+    )
+    expect(guidelineBlocks('other')[0]?.text ?? '').not.toContain('Warm.')
+  })
+
+  it('refuses to accept a proposal into a rule’s name, leaving it pending', () => {
+    actions.setScopedGuideline('workspace', 'ws1', 'tone', '# Tone', actor, undefined, 'instructions')
+    const proposal = actions.addProposal('team', {
+      guideName: 'tone',
+      rule: '- Be terse.',
+      rationale: 'test',
+      basedOn: [],
+    })
+    expect(() => actions.resolveProposal('team', proposal.id, true, actor)).toThrow(actions.ReservedGuidelineName)
+    expect(actions.getProposals('team').find((p) => p.id === proposal.id)?.status).toBe('pending')
+  })
+
+  it('names a workspace rule only to callers with durable access', () => {
+    actions.setScopedGuideline('workspace', 'ws1', 'tone', '# Tone', actor, undefined, 'instructions')
+    actions.setScopedGuideline('instance', INSTANCE, 'alt-text', '# Alt', actor, undefined, 'instructions')
+    const caught = (name: string) => {
+      try {
+        actions.setGuideline('team', name, '# Mine', actor)
+      } catch (e) {
+        return e
+      }
+    }
+    expect(actions.guidelineErrorFor(caught('tone'), true)).toContain('organisation rule')
+    const generic = actions.guidelineErrorFor(caught('tone'), false)
+    expect(generic).toContain('cannot be used for a doc on this canvas')
+    expect(generic).not.toContain('organisation')
+    /* the instance's rules are every account's to see */
+    expect(actions.guidelineErrorFor(caught('alt-text'), false)).toContain('organisation rule')
+  })
+
+  it('lists the canvases whose doc a rule hides', () => {
+    store.setGuideline('team', 'legacy', '# Old', 'Ada')
+    store.setGuideline('other', 'legacy', '# Old', 'Ada')
+    expect(actions.shadowedCanvasDocs('workspace', 'ws1', 'legacy')).toEqual([{ id: 'team', name: 'team' }])
+    expect(actions.shadowedCanvasDocs('instance', INSTANCE, 'legacy').map((c) => c.id)).toEqual(['team', 'other'])
   })
 })
 

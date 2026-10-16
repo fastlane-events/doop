@@ -21,13 +21,20 @@ working rules to every agent without any client-side setup.
   scope is an organisation rule and is never shadowed: a canvas write (REST, MCP, the resident,
   imports, accepted proposals — all through `actions.setGuideline`) using an inherited rule's name
   is refused, a workspace write using an instance rule's name is refused, and the merge keeps the
-  rule even over a doc that predates it.
+  rule even over a doc that predates it. Such an older doc stays (deletable) and Memory flags it
+  "Hidden by an organisation rule of the same name"; saving the rule (REST answers `hidden`, the
+  settings UI shows it, the CLI warns) lists the canvases it now hides on. The refusal names the
+  rule only to callers who may see it: a workspace rule's name collision reads as a generic "cannot
+  be used on this canvas" for callers without durable access. The distiller is told the rule
+  names and never proposes into one; accepting a proposal that collides anyway answers 400 and
+  leaves it pending.
 - **Who sees the workspace's docs**: only readers with durable access to the canvas (owner,
   invited members, workspace members — `hasDurableCanvasAccess`). A share-link visitor gets the
   instance's docs and the canvas's own, on every surface: REST `GET /api/canvases/:id`, the WS
   init, WS broadcasts (`durableOnly`), MCP `get_canvas` / `list_guidelines` / `get_guidelines`,
-  the nudge and the resident prompt (judged for the run's requester). The instance's docs are
-  visible to every account and agent on the install.
+  and the nudge. The instance's docs are visible to every account and agent on the install. The
+  resident agents always get the workspace's docs on its canvases, whoever asked for the run: the
+  canvas is the workspace's, and the system prompt never reaches the requester.
 - Scoped docs live in the store next to the canvases (`store.getScopedGuidelines`), hydrated at
   boot; a deleted workspace drops its docs and history.
 
@@ -94,4 +101,4 @@ install").
   lands, so a crash in between loses the write.
 - Moving a canvas between workspaces does not push the new inherited set to open viewers; they
   see it on reload.
-- The distiller proposes into canvas docs only.
+- The distiller proposes into canvas docs only (avoiding the organisation rules' names).
