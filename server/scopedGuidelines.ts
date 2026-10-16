@@ -48,7 +48,10 @@ export function putScoped(
       typeof title === 'string' ? title : undefined,
       kind,
     )
-    res.json(doc ? { ok: true, doc } : { ok: true, deleted: true })
+    if (!doc) return res.json({ ok: true, deleted: true })
+    /* a rule hides any same-named canvas doc below it: say which */
+    const hidden = doc.kind === 'instructions' ? actions.shadowedCanvasDocs(scope, scopeId, doc.name) : []
+    res.json({ ok: true, doc, ...(hidden.length ? { hidden } : {}) })
   } catch (e) {
     res.status(400).json({ error: e instanceof Error ? e.message : 'invalid doc' })
   }

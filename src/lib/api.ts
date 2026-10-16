@@ -270,8 +270,17 @@ export interface GuidelineVersion {
   savedBy: string
 }
 
+/** What a guideline save answers; `hidden` lists the canvases whose own doc
+ *  of that name a just-saved organisation rule now hides. */
+export interface GuidelineSaveResult {
+  ok: boolean
+  doc?: GuidelineDoc
+  deleted?: boolean
+  hidden?: { id: string; name: string }[]
+}
+
 function putGuideline(url: string, markdown: string, title?: string, kind?: GuidelineKind) {
-  return req(url, {
+  return req<GuidelineSaveResult>(url, {
     method: 'PUT',
     body: JSON.stringify({ markdown, ...(title !== undefined ? { title } : {}), ...(kind ? { kind } : {}) }),
   })

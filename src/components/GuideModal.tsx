@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { GuidelineDoc, GuidelineKind } from '../../shared/types'
-import type { GuidelineVersion } from '../lib/api'
+import type { GuidelineSaveResult, GuidelineVersion } from '../lib/api'
+import { Callout } from './ui/callout'
 import { timeAgo } from '../lib/time'
 import { Sel } from './AutomateShell'
 import { Button } from './ui/button'
@@ -340,7 +341,18 @@ function GuideHistory({
 
 /** The rows of a guide list: title, a one-line summary, who edited it last.
  *  `badge` marks a row's origin (an inherited scope) or its kind. */
-export function GuideRow({ doc, badge, onOpen }: { doc: GuidelineDoc; badge?: string; onOpen: () => void }) {
+export function GuideRow({
+  doc,
+  badge,
+  warning,
+  onOpen,
+}: {
+  doc: GuidelineDoc
+  badge?: string
+  /** why this doc is not in effect, shown under its summary */
+  warning?: string
+  onOpen: () => void
+}) {
   return (
     <ListRow onClick={onOpen}>
       <ListTitle>
@@ -355,6 +367,7 @@ export function GuideRow({ doc, badge, onOpen }: { doc: GuidelineDoc; badge?: st
         )}
       </ListTitle>
       <ListSummary>{summarize(doc.markdown)}</ListSummary>
+      {warning && <span className="text-[11.5px] leading-[1.4] text-accent-ink">{warning}</span>}
       <ListMeta>
         {doc.updatedBy} · {timeAgo(doc.updatedAt)}
       </ListMeta>
@@ -405,6 +418,7 @@ export function GuideList({
 /** Reads and writes one scope's guides over REST. */
 export interface ScopeGuidesApi extends GuideSource {
   list(): Promise<GuidelineDoc[]>
+  save(name: string, markdown: string, title?: string, kind?: GuidelineKind): Promise<GuidelineSaveResult>
 }
 
 /** A workspace's or the install's guides, loaded from `scopeApi` and
@@ -420,6 +434,8 @@ export function ScopedGuides({
 }) {
   const [docs, setDocs] = useState<GuidelineDoc[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /** canvases whose same-named doc the last saved rule now hides */
+  const [hidden, setHidden] = useState<{ rule: string; canvases: { id: string; name: string }[] } | null>(null)
   const reload = useCallback(
     () =>
       scopeApi
@@ -437,7 +453,8 @@ export function ScopedGuides({
         ? {
             history: (name) => scopeApi.history(name),
             save: async (name, markdown, title, kind) => {
-              await scopeApi.save(name, markdown, title, kind)
+              const saved = await scopeApi.save(name, markdown, title, kind)
+              setHidden(saved.hidden?.length ? { rule: name, canvases: saved.hidden } : null)
               await reload()
             },
           }
@@ -446,5 +463,16 @@ export function ScopedGuides({
   )
   if (error) return <p className={errorText}>{error}</p>
   if (!docs) return <ListHint>…</ListHint>
-  return <GuideList docs={docs} source={source} hint={hint} />
+  return (
+    <>
+      {hidden && (
+        <Callout tone="error" className="mx-4 mt-3">
+          “{hidden.rule}” now hides the canvas doc of the same name on {hidden.canvases.length}{' '}
+          {hidden.canvases.length === 1 ? 'canvas' : 'canvases'}: {hidden.canvases.map((c) => c.name).join(', ')}. Their
+          editors see it flagged in Memory and can delete or rename it.
+        </Callout>
+      )}
+      <GuideList docs={docs} source={source} hint={hint} />
+    </>
+  )
 }

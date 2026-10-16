@@ -59,6 +59,9 @@ export function MemoryPanel() {
   if (!canvasId || !source) return null
 
   const ownDocs = docs ?? []
+  /* an organisation rule hides a canvas doc that shares its name (one that
+     predates the rule — new ones are refused); it can still be deleted */
+  const ruleNames = new Set(inherited.filter((d) => d.kind === 'instructions').map((d) => d.name))
   const inheritedOpen = inherited.find((d) => d.name === openInherited)
   const pending = proposals.filter((p) => p.status === 'pending')
   const empty =
@@ -157,7 +160,12 @@ export function MemoryPanel() {
         <ListHint>Style guides every agent reads before designing here.</ListHint>
       )}
       {ownDocs.map((d) => (
-        <GuideRow key={d.name} doc={d} onOpen={() => setOpenGuide(d.name)} />
+        <GuideRow
+          key={d.name}
+          doc={d}
+          warning={ruleNames.has(d.name) ? 'Hidden by an organisation rule of the same name' : undefined}
+          onOpen={() => setOpenGuide(d.name)}
+        />
       ))}
       {inherited.map((d) => (
         <GuideRow

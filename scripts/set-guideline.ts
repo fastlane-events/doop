@@ -83,6 +83,18 @@ function parse(argv: string[]): Options {
   }
 }
 
+/** The canvases whose own doc of this name the rule now hides — read from
+ *  the database, since this process holds no canvases (the server's
+ *  equivalent is actions.shadowedCanvasDocs). */
+async function shadowedCanvasDocs(opts: Options, name: string) {
+  const rows = await db
+    .select({ id: t.canvases.id, name: t.canvases.name, workspaceId: t.canvases.workspaceId })
+    .from(t.guidelines)
+    .innerJoin(t.canvases, eq(t.canvases.id, t.guidelines.canvasId))
+    .where(eq(t.guidelines.name, name))
+  return rows.filter((c) => opts.scope === 'instance' || c.workspaceId === opts.scopeId)
+}
+
 async function main() {
   const opts = parse(process.argv.slice(2))
   await initDb()
@@ -100,8 +112,17 @@ async function main() {
     process.exit(1)
   }
   const where = opts.scope === 'workspace' ? `workspace ${opts.scopeId}` : 'the instance'
-  if (doc) console.log(`${existed ? 'updated' : 'created'} ${doc.kind} guideline "${doc.name}" on ${where}`)
-  else console.log(existed ? `deleted guideline "${slug}" from ${where}` : `no guideline "${slug}" on ${where}`)
+  if (!doc) {
+    console.log(existed ? `deleted guideline "${slug}" from ${where}` : `no guideline "${slug}" on ${where}`)
+  } else {
+    console.log(`${existed ? 'updated' : 'created'} ${doc.kind} guideline "${doc.name}" on ${where}`)
+    /* a rule hides any same-named canvas doc below it: say which */
+    const hidden = doc.kind === 'instructions' ? await shadowedCanvasDocs(opts, doc.name) : []
+    if (hidden.length)
+      console.warn(
+        `warning: this rule hides the canvas doc "${doc.name}" on ${hidden.length} canvas(es): ${hidden.map((c) => `${c.name} (${c.id})`).join(', ')}`,
+      )
+  }
   console.log('a running server picks this up on its next restart')
   process.exit(0)
 }
