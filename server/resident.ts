@@ -15,7 +15,6 @@ import * as ingest from './ingest.ts'
 import { viewWebsite, referencedUrls } from './website.ts'
 import { createImportedWebpageFrame, findImportedWebpageFrame } from './webpageImport.ts'
 import { canvasNotes, DESIGN_BRIEF, DESIGN_QUALITY, organisationRules } from './guide.ts'
-import { hasDurableCanvasAccess } from './access.ts'
 import * as workspaces from './workspaces.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
 import type { Actor, AgentTask, Frame } from '../shared/types.ts'
@@ -457,7 +456,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       /* canvas design docs ride as a second system block with their own cache
          breakpoint: the role prefix stays cacheable across canvases, and the
          (rarely-changing) docs cache across the turns of a run */
-      const guidelinesBlock = guidelineBlocks(canvasId, payer || canvasOwner)
+      const guidelinesBlock = guidelineBlocks(canvasId)
       /* a text-only model would otherwise chase tools whose whole value is
          pixels; steer its verification to the textual surfaces instead */
       const noVisionBlock = runState.vision
@@ -742,17 +741,16 @@ function currentStatus(canvasId: string, actor: Actor): string {
   return actions.getTasks(canvasId).find((t) => t.agentName === actor.name && !t.endedAt && !t.queuedBy)?.status ?? ''
 }
 
-/** The guideline system block for a run on a canvas, for the person the run
- *  works for (`requesterId`): its style docs (its own and inherited) as
- *  design guidelines; the instance's and its workspace's `instructions` docs
- *  as the organisation's rules, rendered the way get_guide serves them to
- *  external agents; its own `instructions` docs, lower down, as notes from
- *  its editors. The workspace's docs only for a requester with durable
- *  access, as everywhere else. */
-function guidelineBlocks(canvasId: string, requesterId: string | undefined): { text: string; cache: boolean }[] {
+/** The guideline system block for a run on a canvas: its style docs (its
+ *  own and inherited) as design guidelines; the instance's and its
+ *  workspace's `instructions` docs as the organisation's rules, rendered the
+ *  way get_guide serves them to external agents; its own `instructions`
+ *  docs, lower down, as notes from its editors. Always with the workspace's
+ *  docs, whoever asked for the run: the canvas is the workspace's, and the
+ *  system prompt never reaches the requester. */
+export function guidelineBlocks(canvasId: string): { text: string; cache: boolean }[] {
   const canvas = store.getCanvas(canvasId)
-  const withWorkspace = !!canvas && hasDurableCanvasAccess(requesterId, canvas)
-  const docs = actions.effectiveGuidelines(canvasId, withWorkspace)
+  const docs = actions.effectiveGuidelines(canvasId, true)
   const style = docs.filter((d) => d.kind === 'style')
   const workspaceId = canvas?.workspaceId ?? ''
   const rules = organisationRules([

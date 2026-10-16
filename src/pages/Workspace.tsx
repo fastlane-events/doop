@@ -271,8 +271,9 @@ function RulesPane({ ws, admin }: { ws: WorkspaceDetail; admin: boolean }) {
       <CardHeader>
         <CardTitle>Rules</CardTitle>
         <CardDescription>
-          Every canvas in {ws.name} follows these, and every agent working on one reads them: style guides for how
-          designs look, agent instructions for how agents work. Visible to members of this workspace. A canvas’s own
+          Every canvas in {ws.name} follows these: style guides for how designs look, agent instructions for how agents
+          work. Doop’s own agents read them on every canvas here, and so does any agent a member connects. Visible to
+          members of this workspace — someone with only a share link (and their agent) doesn’t see them. A canvas’s own
           style guide with the same name overrides one here; agent instructions can’t be overridden.
           {admin ? '' : ' Only workspace admins can change them.'}
         </CardDescription>
