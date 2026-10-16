@@ -149,15 +149,21 @@ function ruleSourcesFor(userId?: string): RuleSource[] {
 }
 
 /** The initialize instructions, plus the names of the install's own working
- *  rules — the server is built per request, so this is always current. */
+ *  rules — the server is built per request, so this is always current — and
+ *  where this deployment's source is (AGPL §13 reaches network users of the
+ *  MCP surface too). */
 function instructionsFor(): string {
   const names = store
     .getScopedGuidelines('instance', actions.INSTANCE_SCOPE_ID)
     .filter((d) => d.kind === 'instructions')
     .map((d) => d.name)
-  return names.length
-    ? `${INSTRUCTIONS}\n- This install's rules for agents: ${names.join(', ')} — get_guide includes them in full.`
-    : INSTRUCTIONS
+  return [
+    INSTRUCTIONS,
+    ...(names.length
+      ? [`- This install's rules for agents: ${names.join(', ')} — get_guide includes them in full.`]
+      : []),
+    ...(env.DOOP_SOURCE_URL ? [`- Source code of this Doop deployment: ${env.DOOP_SOURCE_URL}`] : []),
+  ].join('\n')
 }
 
 /** Append any undelivered human feedback for this agent to a tool result.
