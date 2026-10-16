@@ -545,9 +545,11 @@ app.post('/api/account-exists', async (req, res) => {
 
 /* Public: is SSO configured, and what should the login button say? Static
    build shared across self-hosted deploys can't know this at build time —
-   see server/auth.ts loginProvidersConfig for what's safe to expose here. */
+   see server/auth.ts loginProvidersConfig for what's safe to expose here.
+   Also where this deployment's source code is (DOOP_SOURCE_URL): public on
+   purpose, since the AGPL offers it to everyone who reaches the server. */
 app.get('/api/oidc-config', (req, res) => {
-  res.json(loginProvidersConfig())
+  res.json({ ...loginProvidersConfig(), sourceUrl: env.DOOP_SOURCE_URL })
 })
 
 /* ------------------------------------------------------------------ */

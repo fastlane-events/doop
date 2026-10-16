@@ -197,6 +197,10 @@ const schema = {
   /* ---------------------------------------------------- backgrounds */
   BACKGROUNDS_ORIGIN: origin({ default: undefined }),
 
+  /* -------------------------------------------------------- licence */
+  /* where this deployment's source lives (AGPL §13); unset = no link */
+  DOOP_SOURCE_URL: origin({ default: undefined }),
+
   /* ---------------------------------------------------- rate limits */
   MCP_UPLOADS_PER_MIN: perMinute({ default: 15 }),
   MCP_SEARCHES_PER_MIN: perMinute({ default: 12 }),
