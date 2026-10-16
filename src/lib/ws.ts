@@ -159,7 +159,7 @@ function handle(msg: ServerMessage) {
       s.renameCanvasLocal(msg.name)
       break
     case 'guidelines':
-      s.setGuidelineLocal(msg.name, msg.doc)
+      s.setGuidelineLocal(msg.name, msg.doc, msg.scope)
       break
     case 'reference':
       s.setReferenceLocal(msg.id, msg.reference)

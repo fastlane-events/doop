@@ -1,8 +1,17 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { adminApi, type AdminCanvas, type AdminUser } from '../lib/api'
 import { navigate } from '../App'
 import { timeAgo } from '../lib/time'
-import { AccountMenu, ConnectCard, IconBack, IconChevron, IconGrid, IconShare } from '../components/DashShell'
+import {
+  AccountMenu,
+  ConnectCard,
+  IconBack,
+  IconChevron,
+  IconGrid,
+  IconRules,
+  IconShare,
+} from '../components/DashShell'
+import { ScopedGuides, type ScopeGuidesApi } from '../components/GuideModal'
 import { Tabs, TabsList, TabsTrigger } from '../components/ui/tabs'
 import { cn } from '@/lib/utils'
 import { Button } from '../components/ui/button'
@@ -23,6 +32,8 @@ import {
   DashTitle,
 } from '../components/ui/dash'
 
+type Tab = 'canvases' | 'users' | 'rules'
+
 /* rows and tiles share the Card surface */
 const cardShell = cn(cardVariants(), 'overflow-hidden text-left transition-[transform,box-shadow,border-color]')
 
@@ -38,7 +49,7 @@ export function Admin() {
   const [data, setData] = useState<{ total: number; canvases: AdminCanvas[] } | null>(null)
   const [users, setUsers] = useState<AdminUser[] | null>(null)
   const [stats, setStats] = useState<{ users: number; canvases: number; frames: number } | null>(null)
-  const [tab, setTab] = useState<'canvases' | 'users'>('canvases')
+  const [tab, setTab] = useState<Tab>('canvases')
   const [q, setQ] = useState('')
   const [denied, setDenied] = useState(false)
 
@@ -143,6 +154,9 @@ export function Admin() {
           >
             Accounts
           </DashNavItem>
+          <DashNavItem icon={<IconRules />} active={tab === 'rules'} onClick={() => setTab('rules')}>
+            Rules
+          </DashNavItem>
         </nav>
 
         <div className="min-h-6 flex-1" />
@@ -198,11 +212,7 @@ export function Admin() {
             </div>
           </div>
 
-          <Tabs
-            value={tab}
-            onValueChange={(next) => setTab(next as 'canvases' | 'users')}
-            className="mt-4 flex md:hidden"
-          >
+          <Tabs value={tab} onValueChange={(next) => setTab(next as Tab)} className="mt-4 flex md:hidden">
             <TabsList className="h-10 w-full border border-line bg-surface p-1 shadow-card">
               <TabsTrigger value="canvases">
                 <IconGrid /> Canvases · {stats?.canvases ?? '…'}
@@ -210,10 +220,15 @@ export function Admin() {
               <TabsTrigger value="users">
                 <IconShare /> Accounts · {stats?.users ?? '…'}
               </TabsTrigger>
+              <TabsTrigger value="rules">
+                <IconRules /> Rules
+              </TabsTrigger>
             </TabsList>
           </Tabs>
 
-          {tab === 'canvases' ? (
+          {tab === 'rules' ? (
+            <InstanceRules />
+          ) : tab === 'canvases' ? (
             <>
               {data && data.total > data.canvases.length && (
                 <div className="mt-[18px] flex flex-wrap items-center gap-2.5 text-xs text-ink-faint">
@@ -313,6 +328,29 @@ export function Admin() {
         </DashContent>
       </DashMain>
     </DashLayout>
+  )
+}
+
+/** The install's own guidelines: every canvas inherits them, and every agent
+ *  that connects gets the agent instructions among them with its guide. */
+function InstanceRules() {
+  const scopeApi = useMemo<ScopeGuidesApi>(
+    () => ({
+      list: adminApi.guidelines,
+      history: adminApi.guidelineHistory,
+      save: adminApi.setGuideline,
+    }),
+    [],
+  )
+  return (
+    <div className="mt-4 overflow-hidden rounded-[14px] border border-line bg-surface shadow-card">
+      <p className="px-[18px] pt-3.5 text-[13px] leading-[1.55] text-ink-soft">
+        Rules for the whole instance. Every canvas follows them, and every agent that connects — the built-in ones and
+        people’s own — receives the agent instructions among them. A workspace or canvas rule with the same name
+        overrides one here.
+      </p>
+      <ScopedGuides scopeApi={scopeApi} canEdit hint="No instance rules yet." />
+    </div>
   )
 }
 

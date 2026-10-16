@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { WorkspaceDetail, WorkspaceRole } from '../../shared/types'
 import { formatUsd, STATUS_LABELS, TEAM_SEAT_PRICE } from '../../shared/billing'
 import { navigate } from '../App'
@@ -12,9 +12,11 @@ import {
   IconBilling,
   IconChevron,
   IconGear,
+  IconRules,
   IconShare,
 } from '../components/DashShell'
 import { UpgradeModal } from '../components/WorkspaceModals'
+import { ScopedGuides, type ScopeGuidesApi } from '../components/GuideModal'
 import { Sel } from '../components/AutomateShell'
 import { Avatar } from '../components/ui/avatar'
 import { Badge } from '../components/ui/badge'
@@ -40,7 +42,7 @@ import {
 } from '../components/ui/dash'
 import { timeAgo } from '../lib/time'
 
-type Pane = 'members' | 'billing' | 'general'
+type Pane = 'members' | 'rules' | 'billing' | 'general'
 
 /**
  * One workspace's settings, in the dashboard shell: who is in it, what it
@@ -141,6 +143,9 @@ export function Workspace({ workspaceId }: { workspaceId: string }) {
           <DashNavItem icon={<IconShare />} active={pane === 'members'} onClick={() => setPane('members')}>
             People
           </DashNavItem>
+          <DashNavItem icon={<IconRules />} active={pane === 'rules'} onClick={() => setPane('rules')}>
+            Rules
+          </DashNavItem>
           <DashNavItem icon={<IconBilling />} active={pane === 'billing'} onClick={() => setPane('billing')}>
             Plan &amp; billing
           </DashNavItem>
@@ -187,6 +192,7 @@ export function Workspace({ workspaceId }: { workspaceId: string }) {
           <Tabs value={pane} onValueChange={(next) => setPane(next as Pane)} className="mt-4 flex md:hidden">
             <TabsList className="h-10 w-full border border-line bg-surface p-1 shadow-card">
               <TabsTrigger value="members">People</TabsTrigger>
+              <TabsTrigger value="rules">Rules</TabsTrigger>
               <TabsTrigger value="billing">Billing</TabsTrigger>
               <TabsTrigger value="general">General</TabsTrigger>
             </TabsList>
@@ -216,6 +222,8 @@ export function Workspace({ workspaceId }: { workspaceId: string }) {
             <Skeleton className="mt-5 min-h-[260px] max-w-[1000px] rounded-[12px]" />
           ) : pane === 'members' ? (
             <MembersPane ws={ws} meId={meId} admin={admin} onChange={reload} onError={handle} onToast={showToast} />
+          ) : pane === 'rules' ? (
+            <RulesPane ws={ws} admin={admin} />
           ) : pane === 'billing' ? (
             <BillingPane
               ws={ws}
@@ -242,6 +250,34 @@ export function Workspace({ workspaceId }: { workspaceId: string }) {
       )}
       {toast && <Toast>{toast}</Toast>}
     </DashLayout>
+  )
+}
+
+/* ---- rules ---- */
+
+/** The guidelines every canvas in the workspace inherits — style guides and
+ *  agent instructions. Everyone reads them; admins write them. */
+function RulesPane({ ws, admin }: { ws: WorkspaceDetail; admin: boolean }) {
+  const scopeApi = useMemo<ScopeGuidesApi>(
+    () => ({
+      list: () => api.workspaceGuidelines(ws.id),
+      history: (name) => api.workspaceGuidelineHistory(ws.id, name),
+      save: (name, markdown, title, kind) => api.setWorkspaceGuideline(ws.id, name, markdown, title, kind),
+    }),
+    [ws.id],
+  )
+  return (
+    <Card className="mt-4 max-w-[1000px] overflow-hidden sm:mt-5">
+      <CardHeader>
+        <CardTitle>Rules</CardTitle>
+        <CardDescription>
+          Every canvas in {ws.name} follows these, and every agent working on one reads them: style guides for how
+          designs look, agent instructions for how agents work. A canvas’s own rule with the same name overrides one
+          here.{admin ? '' : ' Only workspace admins can change them.'}
+        </CardDescription>
+      </CardHeader>
+      <ScopedGuides scopeApi={scopeApi} canEdit={admin} hint="No workspace rules yet." />
+    </Card>
   )
 }
 
