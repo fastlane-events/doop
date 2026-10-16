@@ -26,7 +26,8 @@ format:check, build, test) but does not build or push a container image.
 
 A deployment running a modified build must offer its source to network users (AGPL-3.0 §13): set
 `DOOP_SOURCE_URL` to the source of what is deployed and every page shows a small "Source code"
-link (`src/components/SourceLink.tsx`, fed by the public `/api/oidc-config`). Unset, no link.
+link (`src/components/SourceLink.tsx`, fed by the public `/api/oidc-config`) — in the corner, or
+on the canvas in the Connect AI dialog — and the MCP initialize instructions name it. Unset, none.
 
 ## Desktop app (Tauri: macOS DMG + Windows NSIS installer)
 

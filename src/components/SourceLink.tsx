@@ -1,20 +1,17 @@
 import { useEffect, useState } from 'react'
+import { useSourceUrl } from '../lib/sourceUrl'
 
 /**
  * The AGPL §13 source offer: a deployment that sets DOOP_SOURCE_URL gets a
  * small "Source code" link in the bottom-right corner of every page, signed
- * in or out. Unset (the default), nothing renders. The URL comes from the
- * public /api/oidc-config, the one config endpoint the signed-out app reads.
+ * in or out — except the canvas, whose panels and bottom sheet own that
+ * corner; there the offer sits in the Connect AI dialog (ConnectModal),
+ * reachable at every width. Unset (the default), nothing renders.
  */
 export function SourceLink() {
-  const [url, setUrl] = useState<string | null>(null)
-  useEffect(() => {
-    fetch('/api/oidc-config')
-      .then((res) => (res.ok ? res.json() : {}))
-      .then((config: { sourceUrl?: string }) => setUrl(config.sourceUrl ?? null))
-      .catch(() => {}) // no offer to show; nothing else depends on it
-  }, [])
-  if (!url) return null
+  const url = useSourceUrl()
+  const onCanvas = useOnCanvas()
+  if (!url || onCanvas) return null
   return (
     <a
       href={url}
@@ -25,4 +22,15 @@ export function SourceLink() {
       Source code
     </a>
   )
+}
+
+/** Whether the current route is a canvas (/c/<id>); follows navigate(). */
+function useOnCanvas(): boolean {
+  const [path, setPath] = useState(location.pathname)
+  useEffect(() => {
+    const onPop = () => setPath(location.pathname)
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+  return path.startsWith('/c/')
 }
