@@ -2,12 +2,15 @@ import express from 'express'
 import { inArray, count } from 'drizzle-orm'
 import { store } from './store.ts'
 import { isAdmin } from './access.ts'
+import { INSTANCE_SCOPE_ID } from './actions.ts'
+import * as scoped from './scopedGuidelines.ts'
 import { db } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
 
 /**
  * Instance-admin surface, mounted at /api/admin (so already behind the
- * session gate in index.ts). Read-only by design: it lists what exists, and
+ * session gate in index.ts). Read-only by design — save the install's own
+ * guidelines, which every canvas inherits — it lists what exists, and
  * the way in to a specific canvas is impersonation — better-auth's own
  * /api/auth/admin/impersonate-user — not a privileged read here. That keeps
  * canAccessCanvas the single answer to "may this user see this canvas",
@@ -71,3 +74,13 @@ adminRouter.get('/users', async (req, res) => {
       .sort((a, b) => b.createdAt - a.createdAt),
   )
 })
+
+/* The install's guidelines: every canvas on the instance inherits them, and
+   every agent gets their `instructions` docs with get_guide. */
+adminRouter.get('/guidelines', (req, res) => scoped.listScoped(res, 'instance', INSTANCE_SCOPE_ID))
+
+adminRouter.get('/guidelines/:name/history', (req, res) =>
+  scoped.sendScopedHistory(req, res, 'instance', INSTANCE_SCOPE_ID),
+)
+
+adminRouter.put('/guidelines/:name', (req, res) => scoped.putScoped(req, res, 'instance', INSTANCE_SCOPE_ID))

@@ -63,9 +63,9 @@ import { GEMINI_MODELS, OPENROUTER_MODELS } from '../shared/modelMenu.ts'
 import type { ModelOption } from '../shared/modelMenu.ts'
 import { mentionedRole } from '../shared/agents.ts'
 import { activeAgentTasks } from '../shared/agentActivity.ts'
-import { colorFor } from '../shared/types.ts'
+import { colorFor, isGuidelineKind } from '../shared/types.ts'
 import { isPeerViewport } from '../shared/viewport.ts'
-import type { ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
+import type { Canvas, ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
 
 const PORT = env.PORT
 
@@ -94,6 +94,7 @@ if (data.canvases.length === 0 && (await persist.importLegacyJson())) {
   data = await persist.hydrate()
 }
 store.init(data.canvases)
+store.initScopedGuidelines(data.scopedGuidelines)
 await workspaces.hydrateWorkspaces() // before the first request: canAccessCanvas reads membership
 await webhooks.hydrateWebhooks()
 billing.reportBillingConfig()
@@ -627,6 +628,12 @@ app.get('/api/me', async (req, res) => {
 /* Canvas access on the REST surface: resolve the canvas (or the frame's
    canvas) and run it through canAccessCanvas before touching anything.
    Both helpers write the error response themselves and return null. */
+/** A canvas as its viewers get it: with the workspace and instance
+ *  guidelines it inherits, which the store keeps outside the canvas. */
+function withInheritedGuidelines(c: Canvas): Canvas {
+  return { ...c, inheritedGuidelines: actions.inheritedGuidelines(c.id) }
+}
+
 function requireCanvas(req: express.Request, res: express.Response, canvasId: string) {
   const c = store.getCanvas(canvasId)
   if (!c) {
@@ -919,7 +926,7 @@ app.post('/api/canvases/:id/duplicate', async (req, res) => {
 
 app.get('/api/canvases/:id', (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
-  if (c) res.json(c)
+  if (c) res.json(withInheritedGuidelines(c))
 })
 
 /* Community gallery listing — the owner's call alone, like link access.
@@ -1325,7 +1332,9 @@ app.get('/api/canvases/:id/guidelines/:name/history', async (req, res) => {
 app.put('/api/canvases/:id/guidelines/:name', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
   const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
-  const { markdown, x, y, title } = req.body ?? {}
+  const { markdown, x, y, title, kind } = req.body ?? {}
+  if (kind !== undefined && !isGuidelineKind(kind))
+    return res.status(400).json({ error: "kind must be 'style' or 'instructions'" })
   /* no markdown = metadata patch (position/title): content and history untouched */
   if (markdown === undefined) {
     const patch = {
@@ -1345,6 +1354,7 @@ app.put('/api/canvases/:id/guidelines/:name', (req, res) => {
       actor,
       pos,
       typeof title === 'string' ? title : undefined,
+      kind,
     )
     if (doc === undefined) return res.status(404).json({ error: 'not found' })
     res.json(doc ? { ok: true, doc } : { ok: true, deleted: true })
@@ -1891,7 +1901,7 @@ wss.on('connection', (ws, upgradeReq) => {
       const agents = [...(agentPresences.get(msg.canvasId)?.values() ?? [])]
       send(ws, {
         type: 'init',
-        canvas,
+        canvas: withInheritedGuidelines(canvas),
         presences: [...others, ...agents],
         activity: actions.getActivity(msg.canvasId),
         tasks: actions.getTasks(msg.canvasId),

@@ -6,6 +6,7 @@ import { db } from './db/index.ts'
 import * as t from './db/schema.ts'
 import * as authSchema from './db/auth-schema.ts'
 import { store } from './store.ts'
+import * as scoped from './scopedGuidelines.ts'
 import * as billing from './billing.ts'
 import { mailerConfigured, sendMail } from './mailer.ts'
 import { isBillingInterval, isWorkspaceActive } from '../shared/billing.ts'
@@ -229,6 +230,7 @@ export async function deleteWorkspace(id: string): Promise<void> {
   if (!ws) return
   if (billing.billingEnabled()) await billing.cancelSubscription(ws)
   store.detachWorkspace(id)
+  store.dropScopedGuidelines('workspace', id)
   records.delete(id)
   members.delete(id)
   await db.transaction(async (tx) => {
@@ -556,6 +558,23 @@ workspacesRouter.patch('/:id', (req, res) => {
   if (!name) return res.status(400).json({ error: 'name required' })
   renameWorkspace(ws.id, name)
   res.json(summaryFor(ws, req.user!.id))
+})
+
+/* Guidelines every canvas in the workspace inherits: members read them (an
+   agent on any of its canvases does anyway), admins write them. */
+workspacesRouter.get('/:id/guidelines', (req, res) => {
+  const ws = requireWorkspace(req, res, req.params.id)
+  if (ws) scoped.listScoped(res, 'workspace', ws.id)
+})
+
+workspacesRouter.get('/:id/guidelines/:name/history', async (req, res) => {
+  const ws = requireWorkspace(req, res, req.params.id)
+  if (ws) await scoped.sendScopedHistory(req, res, 'workspace', ws.id)
+})
+
+workspacesRouter.put('/:id/guidelines/:name', (req, res) => {
+  const ws = requireWorkspace(req, res, req.params.id, 'admin')
+  if (ws) scoped.putScoped(req, res, 'workspace', ws.id)
 })
 
 workspacesRouter.delete('/:id', async (req, res) => {
