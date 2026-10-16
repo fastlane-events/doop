@@ -1465,9 +1465,13 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       },
     },
     async ({ frame_id, scale, agent_name }) => {
-      const f = frameFor(frame_id)
-      if (!f) return noFrame(frame_id)
-      arrive(f.canvasId, agent_name)
+      const live = frameFor(frame_id)
+      if (!live) return noFrame(frame_id)
+      arrive(live.canvasId, agent_name)
+      /* a snapshot: an edit landing while Chromium renders must not stamp
+         this older image with its newer updatedAt, or the cache would serve
+         it as current for the next five minutes */
+      const f = { ...live }
       try {
         const png = await renderFrame(f, scale ?? 1)
         /* the ChatGPT card loads this exact image next — serve it from cache */
