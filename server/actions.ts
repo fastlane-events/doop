@@ -2,7 +2,7 @@ import { nanoid } from 'nanoid'
 import { store } from './store.ts'
 import * as persist from './db/persist.ts'
 import * as thumbs from './thumbs.ts'
-import { colorFor } from '../shared/types.ts'
+import { colorFor, mergeGuidelines } from '../shared/types.ts'
 import {
   DEFAULT_ROLE_ID,
   mentionedRole,
@@ -25,11 +25,14 @@ import type {
   ElementComment,
   Frame,
   GuidelineDoc,
+  GuidelineKind,
+  InheritedScope,
   MemoryProposal,
   MemoryReference,
   RepoCardKind,
   RepoCardPayload,
   RepoScreenRef,
+  ScopedGuidelineDoc,
   ServerMessage,
   TaskFeedback,
 } from '../shared/types.ts'
@@ -1423,6 +1426,20 @@ export function guidelineSummary(doc: GuidelineDoc): string {
   return ''
 }
 
+/** Validate a doc write. Returns the normalized slug, markdown and title;
+ *  throws with a message meant for the caller's error channel. */
+function cleanGuideline(name: string, markdown: string, title?: string) {
+  const slug = name.trim().toLowerCase()
+  if (!GUIDELINE_NAME_RE.test(slug))
+    throw new Error(`invalid doc name “${name}” — use a lowercase slug like "feature-image" (a-z, 0-9, hyphens)`)
+  const clean = markdown.replace(/\r\n/g, '\n').trim()
+  if (clean.length > MAX_GUIDELINE_CHARS)
+    throw new Error(`doc is ${clean.length} chars — the limit is ${MAX_GUIDELINE_CHARS}`)
+  const cleanTitle =
+    title === undefined ? undefined : title.replace(/\s+/g, ' ').trim().slice(0, MAX_GUIDELINE_TITLE_CHARS)
+  return { slug, clean, cleanTitle }
+}
+
 /** Upsert (or, with empty markdown, delete) a design doc. Returns the doc,
  *  null for a deletion, undefined when the canvas is missing; throws on
  *  invalid input with a message meant for the caller's error channel. */
@@ -1433,15 +1450,9 @@ export function setGuideline(
   actor: Actor,
   pos?: { x: number; y: number },
   title?: string,
+  kind?: GuidelineKind,
 ): GuidelineDoc | null | undefined {
-  const slug = name.trim().toLowerCase()
-  if (!GUIDELINE_NAME_RE.test(slug))
-    throw new Error(`invalid doc name “${name}” — use a lowercase slug like "feature-image" (a-z, 0-9, hyphens)`)
-  const clean = markdown.replace(/\r\n/g, '\n').trim()
-  if (clean.length > MAX_GUIDELINE_CHARS)
-    throw new Error(`doc is ${clean.length} chars — the limit is ${MAX_GUIDELINE_CHARS}`)
-  const cleanTitle =
-    title === undefined ? undefined : title.replace(/\s+/g, ' ').trim().slice(0, MAX_GUIDELINE_TITLE_CHARS)
+  const { slug, clean, cleanTitle } = cleanGuideline(name, markdown, title)
 
   if (!clean) {
     const existing = store.getGuidelines(canvasId).find((d) => d.name === slug)
@@ -1456,13 +1467,77 @@ export function setGuideline(
   const existing = store.getGuidelines(canvasId)
   if (!existing.some((d) => d.name === slug) && existing.length >= MAX_GUIDELINE_DOCS)
     throw new Error(`this canvas already has ${MAX_GUIDELINE_DOCS} design guides — delete one first`)
-  const doc = store.setGuideline(canvasId, slug, clean, actor.name, pos, cleanTitle)
+  const doc = store.setGuideline(canvasId, slug, clean, actor.name, pos, cleanTitle, kind)
   if (!doc) return undefined
   persist.saveGuidelineVersion(canvasId, slug, clean, actor.name, doc.updatedAt)
   broadcast(canvasId, { type: 'guidelines', name: slug, doc, actor })
   logActivity(canvasId, actor, `updated the design guide “${guidelineTitle(doc)}”`)
   touch(canvasId, actor)
   return doc
+}
+
+/** The instance scope has one id: the install itself. */
+export const INSTANCE_SCOPE_ID = ''
+
+/** Upsert (or, with empty markdown, delete) a workspace doc (scopeId = the
+ *  workspace id) or an instance doc (scopeId INSTANCE_SCOPE_ID). Same rules
+ *  and history as setGuideline; every open canvas that inherits the doc
+ *  hears about it. Permission is the caller's job. Returns the doc, or null
+ *  for a deletion (of a doc that may not have existed). */
+export function setScopedGuideline(
+  scope: InheritedScope,
+  scopeId: string,
+  name: string,
+  markdown: string,
+  actor: Actor,
+  title?: string,
+  kind?: GuidelineKind,
+): GuidelineDoc | null {
+  const { slug, clean, cleanTitle } = cleanGuideline(name, markdown, title)
+
+  if (!clean) {
+    if (!store.deleteScopedGuideline(scope, scopeId, slug)) return null
+    persist.saveScopedGuidelineVersion(scope, scopeId, slug, '', actor.name, Date.now())
+    broadcastScoped(scope, scopeId, { type: 'guidelines', name: slug, doc: null, actor, scope })
+    return null
+  }
+
+  const existing = store.getScopedGuidelines(scope, scopeId)
+  if (!existing.some((d) => d.name === slug) && existing.length >= MAX_GUIDELINE_DOCS)
+    throw new Error(`this ${scope} already has ${MAX_GUIDELINE_DOCS} guidelines — delete one first`)
+  const doc = store.setScopedGuideline(scope, scopeId, slug, clean, actor.name, cleanTitle, kind)
+  persist.saveScopedGuidelineVersion(scope, scopeId, slug, clean, actor.name, doc.updatedAt)
+  broadcastScoped(scope, scopeId, { type: 'guidelines', name: slug, doc, actor, scope })
+  return doc
+}
+
+/** Tell every canvas below a scope: the workspace's canvases, or all of them. */
+function broadcastScoped(scope: InheritedScope, scopeId: string, msg: ServerMessage) {
+  for (const c of store.canvases.values()) {
+    if (scope === 'instance' || c.workspaceId === scopeId) broadcast(c.id, msg)
+  }
+}
+
+/** The workspace and instance docs a canvas inherits, unmerged. */
+export function inheritedGuidelines(canvasId: string): ScopedGuidelineDoc[] {
+  const workspaceId = store.getCanvas(canvasId)?.workspaceId
+  return [
+    ...store.getScopedGuidelines('instance', INSTANCE_SCOPE_ID).map((d) => ({ ...d, scope: 'instance' as const })),
+    ...(workspaceId
+      ? store.getScopedGuidelines('workspace', workspaceId).map((d) => ({ ...d, scope: 'workspace' as const }))
+      : []),
+  ]
+}
+
+/** Every doc a canvas follows: instance, then its workspace, then its own,
+ *  merged by name with the nearest scope winning. */
+export function effectiveGuidelines(canvasId: string): ScopedGuidelineDoc[] {
+  const inherited = inheritedGuidelines(canvasId)
+  return mergeGuidelines([
+    inherited.filter((d) => d.scope === 'instance'),
+    inherited.filter((d) => d.scope === 'workspace'),
+    store.getGuidelines(canvasId).map((d) => ({ ...d, scope: 'canvas' as const })),
+  ])
 }
 
 /** Patch design-guide metadata (card position, display title) without touching
@@ -1489,17 +1564,28 @@ export function patchGuideline(
   return true
 }
 
-/* Per-process memory of which agents have read a canvas's design docs —
-   worst case after a restart is one extra nudge, same trade-off as the
-   task log's announce tracking. */
-const guidelinesSeen = new Set<string>()
+/* Per-process memory of which of a canvas's docs each agent has read, by
+   scope and name: a doc that appears later — a new workspace rule, or the
+   canvas moving into a workspace — is unread again. Worst case after a
+   restart is one extra nudge, same trade-off as the task log's announce
+   tracking. */
+const guidelinesSeen = new Map<string, Set<string>>()
 
+const seenKey = (doc: ScopedGuidelineDoc) => `${doc.scope}:${doc.name}`
+
+/** Reading the list, or any doc, counts as having read every doc the canvas
+ *  follows right now — the agent picks the relevant ones itself. */
 export function markGuidelinesSeen(canvasId: string, agentName: string) {
-  guidelinesSeen.add(`${canvasId}:${agentName}`)
+  const key = `${canvasId}:${agentName}`
+  const seen = guidelinesSeen.get(key) ?? new Set<string>()
+  for (const doc of effectiveGuidelines(canvasId)) seen.add(seenKey(doc))
+  guidelinesSeen.set(key, seen)
 }
 
-export function hasSeenGuidelines(canvasId: string, agentName: string): boolean {
-  return guidelinesSeen.has(`${canvasId}:${agentName}`)
+/** The docs this canvas follows that the agent has not seen yet. */
+export function unreadGuidelines(canvasId: string, agentName: string): ScopedGuidelineDoc[] {
+  const seen = guidelinesSeen.get(`${canvasId}:${agentName}`)
+  return effectiveGuidelines(canvasId).filter((doc) => !seen?.has(seenKey(doc)))
 }
 
 /* ------------------------------------------------------------------ */

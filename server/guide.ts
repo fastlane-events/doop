@@ -4,6 +4,7 @@
  */
 
 import { AGENT_ROLES } from '../shared/agents.ts'
+import type { GuidelineDoc } from '../shared/types.ts'
 
 export const GUIDE_TOPICS = ['doop-instructions'] as const
 
@@ -387,3 +388,33 @@ The URL re-renders on change, so an embedded link stays current as the frame ite
 - Put new work in new frames beside existing ones; omit x/y to auto-place.
 - Keep the SAME agent_name for your whole session. It is your identity in the room.
 `
+
+/** Where a set of organisation rules comes from, for its heading. */
+export interface RuleSource {
+  /** e.g. 'instance', 'workspace "Acme"' */
+  label: string
+  docs: GuidelineDoc[]
+}
+
+/**
+ * The organisation's working rules — every `instructions` guideline the
+ * reader is subject to, in full. get_guide appends this after the built-in
+ * guide and the resident agents get it in their system prompt, so an agent
+ * with no client-side setup still receives them. Empty when there are none.
+ */
+export function organisationRules(sources: RuleSource[]): string {
+  const sections = sources.flatMap(({ label, docs }) =>
+    docs
+      .filter((doc) => doc.kind === 'instructions')
+      .map((doc) => `### ${doc.title ?? doc.name} (${doc.name}, ${label} scope)\n\n${doc.markdown}`),
+  )
+  if (sections.length === 0) return ''
+  return `## Your organisation's rules
+
+The people who run this Doop install set these working rules for every agent. Follow them on
+every task, alongside the guide above. Where two rules share a name, the narrower scope wins
+on its canvases (canvas over workspace over instance).
+
+${sections.join('\n\n')}
+`
+}

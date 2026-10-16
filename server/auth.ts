@@ -10,6 +10,7 @@ import { store } from './store.ts'
 import * as demo from './demo.ts'
 import { mailerConfigured, sendMail } from './mailer.ts'
 import { acceptInvites } from './workspaces.ts'
+import { isAdmin } from './access.ts'
 import { purgeUserData } from './accountDeletion.ts'
 import { createHash } from 'node:crypto'
 import { createRemoteJWKSet, jwtVerify } from 'jose'
@@ -569,4 +570,15 @@ export async function isBanned(userId: string): Promise<boolean> {
   const banned = row ? !!row.banned : true
   banStates.set(userId, { banned, at: Date.now() })
   return banned
+}
+
+/** Is this account an instance admin? For callers holding only a user id
+ *  (MCP); uncached, since it gates rare writes and a demotion must bite at
+ *  once. */
+export async function isAdminUser(userId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ role: authSchema.user.role })
+    .from(authSchema.user)
+    .where(eq(authSchema.user.id, userId))
+  return isAdmin(row)
 }
