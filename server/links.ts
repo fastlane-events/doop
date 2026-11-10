@@ -11,11 +11,17 @@ export const canvasLink = (canvasId: string) => `${ORIGIN}/c/${canvasId}`
 export const frameLink = (canvasId: string, frameId: string) =>
   `${canvasLink(canvasId)}?frame=${encodeURIComponent(frameId)}`
 
-/** Opens the canvas on the frame with the thread expanded. Always the ROOT's
- *  id (FrameView honours ?comment= for pins, and only roots have pins). */
+/** Opens the canvas with the thread expanded: on its frame for an element
+ *  comment, on its page for a canvas comment (Stage honours ?page= and flies
+ *  to the pin). Always the ROOT's id (pins honour ?comment=, and only roots
+ *  have pins). */
 export function commentLink(comment: ElementComment): string {
   const root = comment.parentId ?? comment.id
-  return `${frameLink(comment.canvasId, comment.frameId)}&comment=${encodeURIComponent(root)}`
+  const page = comment.pageId ? `?page=${encodeURIComponent(comment.pageId)}&` : '?'
+  const base = comment.frameId
+    ? `${frameLink(comment.canvasId, comment.frameId)}&`
+    : `${canvasLink(comment.canvasId)}${page}`
+  return `${base}comment=${encodeURIComponent(root)}`
 }
 
 export const settingsLink = (pane: string) => `${ORIGIN}/settings?pane=${pane}`

@@ -1,14 +1,24 @@
 import { env } from './env.ts'
-import { getLocalAgentPreference } from './localAgentPreferences.ts'
+import { DESCRIBER_ANTHROPIC_MODEL, DESCRIBER_MODELS } from '../shared/modelMenu.ts'
+import { readConnections, usableAccount, type Connections } from './agentDefaults.ts'
 import { geminiCloudRuns, geminiCloudWorkerFor } from './geminiCloudRuns.ts'
 import { localAgentRuns, type LocalHarnessRequest } from './localAgentRuns.ts'
-import type { LocalAgentResult } from '../shared/localAgent.ts'
+import { isClaudeEffort, isClaudeModel, type LocalAgentResult } from '../shared/localAgent.ts'
+import type { RunnerPick } from '../shared/agentRunner.ts'
 import Anthropic from '@anthropic-ai/sdk'
-import { getAccount, withFreshToken, accountModelFor, accountVisionFor } from './modelAccounts.ts'
+import { withFreshToken, accountModelFor, accountVisionFor, accountWithPick } from './modelAccounts.ts'
 import type { AccountKind, ModelAccount } from './modelAccounts.ts'
-import { ModelAuthError, ModelUnavailableError, runAzureTurn, runOpenAiTurn } from './openaiAgent.ts'
+import { ModelAuthError, ModelUnavailableError, effortFor, runAzureTurn, runOpenAiTurn } from './openaiAgent.ts'
 import type { StopReason, TurnBlock } from './openaiAgent.ts'
-import { geminiConfig, openrouterConfig, runChatCompletionsTurn } from './chatCompletionsAgent.ts'
+import {
+  deepseekConfig,
+  geminiConfig,
+  kimiCodeConfig,
+  kimiConfig,
+  openrouterConfig,
+  runChatCompletionsTurn,
+  type ChatCompletionsConfig,
+} from './chatCompletionsAgent.ts'
 
 /**
  * Which model runs a Doop Agent turn, and on whose bill.
@@ -37,6 +47,8 @@ export interface AgentTurnRequest {
   tools: Anthropic.Tool[]
   messages: Anthropic.MessageParam[]
   maxTokens: number
+  /** aborts the turn mid-generation: the run's work was stopped */
+  signal?: AbortSignal
 }
 
 export interface AgentTurnResult {
@@ -68,7 +80,7 @@ const ANTHROPIC_MODEL = env.DOOP_AGENT_MODEL
 
 let anthropic: Anthropic | null = null
 
-function anthropicTier(): AgentModel | null {
+function anthropicTier(model: string = ANTHROPIC_MODEL): AgentModel | null {
   if (!env.ANTHROPIC_API_KEY) {
     warnOnce(
       '[doop-agent] ANTHROPIC_API_KEY not set — the free Doop Agent tier is off. Users who connect a model account of their own still get the agent; everyone else sees queued cards and @mentions go unpicked. See README → "The Doop Agent".',
@@ -79,8 +91,8 @@ function anthropicTier(): AgentModel | null {
   const client = anthropic
   return {
     provider: 'anthropic',
-    label: `Doop (${ANTHROPIC_MODEL})`,
-    run: (req) => runAnthropicTurn(client, ANTHROPIC_MODEL, req),
+    label: `Doop (${model})`,
+    run: (req) => runAnthropicTurn(client, model, req),
   }
 }
 
@@ -102,17 +114,20 @@ export async function runAnthropicTurn(
   req: AgentTurnRequest,
 ): Promise<AgentTurnResult> {
   const res = await client.messages
-    .stream({
-      model,
-      max_tokens: req.maxTokens,
-      system: req.system.map((block) => ({
-        type: 'text' as const,
-        text: block.text,
-        ...(block.cache ? { cache_control: { type: 'ephemeral' as const } } : {}),
-      })),
-      tools: req.tools,
-      messages: req.messages,
-    })
+    .stream(
+      {
+        model,
+        max_tokens: req.maxTokens,
+        system: req.system.map((block) => ({
+          type: 'text' as const,
+          text: block.text,
+          ...(block.cache ? { cache_control: { type: 'ephemeral' as const } } : {}),
+        })),
+        tools: req.tools,
+        messages: req.messages,
+      },
+      { signal: req.signal },
+    )
     .finalMessage()
   const stop: StopReason =
     res.stop_reason === 'refusal'
@@ -146,6 +161,7 @@ function azureTier(): AgentModel | null {
           tools: req.tools,
           messages: req.messages,
           maxTokens: req.maxTokens,
+          signal: req.signal,
         })
       } catch (err) {
         /* these are the SERVER's credentials — "reconnect your account" would
@@ -196,6 +212,20 @@ const BYO_LABELS: Record<AccountKind, string> = {
   'anthropic-key': 'Claude API',
   'openrouter-key': 'OpenRouter',
   'gemini-key': 'Gemini',
+  'deepseek-key': 'DeepSeek',
+  'kimi-key': 'Kimi',
+  'kimi-code': 'Kimi Code',
+}
+
+/* the account kinds that run on the Chat Completions transport */
+const CHAT_COMPLETIONS_CONFIGS: Partial<
+  Record<AccountKind, (apiKey: string, model: string, vision: boolean) => ChatCompletionsConfig>
+> = {
+  'openrouter-key': openrouterConfig,
+  'gemini-key': geminiConfig,
+  'deepseek-key': deepseekConfig,
+  'kimi-key': kimiConfig,
+  'kimi-code': kimiCodeConfig,
 }
 
 /* the OpenAI-shaped transports take one system string; cache breakpoints are
@@ -234,14 +264,12 @@ function byoModel(account: ModelAccount): AgentModel {
       },
     }
   }
-  if (account.kind === 'openrouter-key' || account.kind === 'gemini-key') {
+  const chatCompletionsConfig = CHAT_COMPLETIONS_CONFIGS[account.kind]
+  if (chatCompletionsConfig) {
     if (!account.apiKey) throw new ModelAuthError(`Reconnect your ${BYO_LABELS[account.kind]} key in Settings.`)
     const model = accountModelFor(account)
     const vision = accountVisionFor(account)
-    const config =
-      account.kind === 'openrouter-key'
-        ? openrouterConfig(account.apiKey, model, vision)
-        : geminiConfig(account.apiKey, model, vision)
+    const config = chatCompletionsConfig(account.apiKey, model, vision)
     return {
       provider: account.kind,
       label: `${BYO_LABELS[account.kind]} (${model})`,
@@ -253,12 +281,13 @@ function byoModel(account: ModelAccount): AgentModel {
           tools: req.tools,
           messages: req.messages,
           maxTokens: req.maxTokens,
+          signal: req.signal,
         }),
     }
   }
   return {
     provider: account.kind,
-    label: `${BYO_LABELS[account.kind]} (${accountModelFor(account)})`,
+    label: `${BYO_LABELS[account.kind]} (${accountModelFor(account)}, ${effortFor(account)} effort)`,
     userId: account.userId,
     async run(req) {
       /* refreshed per turn, not per run: a long design run outlives an
@@ -269,6 +298,7 @@ function byoModel(account: ModelAccount): AgentModel {
         tools: req.tools,
         messages: req.messages,
         maxTokens: req.maxTokens,
+        signal: req.signal,
       })
     },
   }
@@ -283,44 +313,84 @@ function byoModel(account: ModelAccount): AgentModel {
  * subscription expects the very next task to run on it, and the free tier is a
  * trial to get them here, not a balance to spend down first. It also means
  * connecting stops costing us anything from that moment on.
+ *
+ * `pick` is what the card asked for (the composer's choice): one of the
+ * person's connections — the Claude Plan on their desktop or one of their
+ * model accounts — and the model and effort on it. Work without a pick (a
+ * comment, an automation), or with one naming a connection that is gone or
+ * switched off, runs on their default (agentDefaults.ts).
  */
-export async function pickModel(payerId?: string): Promise<AgentModel | null> {
-  if (payerId) {
-    const worker = geminiCloudWorkerFor(payerId)
-    if (worker) {
-      return {
-        provider: 'gemini-cloud',
-        label: 'Gemini CLI (cloud pilot)',
-        userId: payerId,
-        runHarness: (req) => geminiCloudRuns.start(payerId, worker, req),
-        run: () =>
-          Promise.reject(
-            new Error('Gemini cloud pilot supports canvas tasks only. Repository imports require a server provider.'),
-          ),
-      }
-    }
-    const local = await getLocalAgentPreference(payerId)
-    if (local.enabled) {
-      if (!localAgentRuns.online(payerId)) return null
-      return {
-        provider: 'claude-local',
-        label: `Claude CLI (${local.model})`,
-        userId: payerId,
-        runHarness: (req) => localAgentRuns.start(payerId, local.model, req),
-        run: () =>
-          Promise.reject(
-            new Error('Repository imports require a server provider. Select your connected account in Settings.'),
-          ),
-      }
+export async function pickModel(payerId?: string, pick?: RunnerPick): Promise<AgentModel | null> {
+  if (!payerId) return serverTiers[serverProvider()]()
+  const worker = geminiCloudWorkerFor(payerId)
+  if (worker) {
+    return {
+      provider: 'gemini-cloud',
+      label: 'Gemini CLI (cloud pilot)',
+      userId: payerId,
+      runHarness: (req) => geminiCloudRuns.start(payerId, worker, req),
+      run: () =>
+        Promise.reject(
+          new Error('Gemini cloud pilot supports canvas tasks only. Repository imports require a server provider.'),
+        ),
     }
   }
-
-  const account = payerId
-    ? await getAccount(payerId).catch((err) => {
-        console.error('[doop-agent] could not read the connected model account', err)
-        return null
-      })
-    : null
-  if (account) return byoModel(account)
+  const connections = await readConnections(payerId).catch((err): Connections => {
+    console.error('[doop-agent] could not read the connected model accounts', err)
+    return { plan: { enabled: false, model: 'default' }, accounts: [], default: undefined }
+  })
+  const picked =
+    pick && (pick.provider === 'claude-local' ? connections.plan.enabled : usableAccount(connections, pick.provider))
+  const provider = picked ? pick.provider : connections.default
+  /* the pick's model and effort apply only to the connection it named */
+  const own = picked ? pick : undefined
+  if (provider === 'claude-local') {
+    /* the Plan never hands its work to another connection while the desktop is away */
+    if (!localAgentRuns.online(payerId)) return null
+    const plan = connections.plan
+    const run = {
+      model: own && isClaudeModel(own.model) ? own.model : plan.model,
+      effort: own && isClaudeEffort(own.effort) ? own.effort : plan.effort,
+    }
+    return {
+      provider: 'claude-local',
+      label: `Claude CLI (${run.model}${run.effort ? `, ${run.effort} effort` : ''})`,
+      userId: payerId,
+      runHarness: (req) => localAgentRuns.start(payerId, run, req),
+      run: () =>
+        Promise.reject(
+          new Error('Repository imports require a server provider. Select your connected account in Settings.'),
+        ),
+    }
+  }
+  const account = usableAccount(connections, provider)
+  if (account) return byoModel(accountWithPick(account, own))
   return serverTiers[serverProvider()]()
+}
+
+/* ---------------------------------------------------------------- */
+/* image descriptions: a small tier, never the design model          */
+/* ---------------------------------------------------------------- */
+
+/**
+ * The model that describes an uploaded image on a user's own account
+ * (shared/imageDescriptions.ts): the provider's small vision tier from
+ * DESCRIBER_MODELS, or the account's own model at low reasoning effort where
+ * the provider's roster is per subscription. Null when the account's model
+ * cannot see images — the caller falls through to the server tier.
+ */
+export function accountDescriber(account: ModelAccount): AgentModel | null {
+  const small: ModelAccount = {
+    ...account,
+    model: DESCRIBER_MODELS[account.kind] ?? account.model,
+    effort: 'low',
+  }
+  if (!accountVisionFor(small)) return null
+  return byoModel(small)
+}
+
+/** The server tier's describer: Haiku on the Anthropic key, the one
+ *  deployment on Azure. Null when the free tier is off. */
+export function serverDescriber(provider: ServerProvider = serverProvider()): AgentModel | null {
+  return provider === 'anthropic' ? anthropicTier(DESCRIBER_ANTHROPIC_MODEL) : azureTier()
 }

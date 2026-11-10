@@ -10,7 +10,14 @@
   "env": {
     "builtin": true
   },
-  "ignorePatterns": ["dist/", "node_modules/", "desktop/src-tauri/target/"],
+  "ignorePatterns": [
+    "dist/",
+    "node_modules/",
+    "desktop/src-tauri/target/",
+    "desktop/src-tauri-chromium/target/",
+    "public/figma-plugin/",
+    "storybook-static/"
+  ],
   "rules": {
     "constructor-super": "error",
     "for-direction": "error",

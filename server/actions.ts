@@ -1,26 +1,47 @@
 import { nanoid } from 'nanoid'
-import { store } from './store.ts'
+import { MAX_DECISION_CHARS } from '../shared/designDecisions.ts'
+import { MAX_PAGES, PageLimitError, store } from './store.ts'
 import * as persist from './db/persist.ts'
 import * as thumbs from './thumbs.ts'
 import { colorFor, mergeGuidelines } from '../shared/types.ts'
-import {
-  DEFAULT_ROLE_ID,
-  mentionedRole,
-  mentionedRoles,
-  normalizePipeline,
-  roleByAgentName,
-  roleName,
-  stripMentions,
-} from '../shared/agents.ts'
+import type { StackWrite } from '../shared/frameStack.ts'
+import { DEFAULT_ROLE_ID, mentionedRole, normalizePipeline, roleByAgentName, roleName } from '../shared/agents.ts'
+import { canvasPages } from '../shared/pages.ts'
+import { FRAME_COMMENT_SELECTOR, isCanvasComment, type CommentAnchorInput } from '../shared/comments.ts'
+import { isElementId } from '../shared/elementId.ts'
+import { parseRunnerPick, runnerKey, type RunnerPick } from '../shared/agentRunner.ts'
+import { hasElementId, stampElementId } from './elementIds.ts'
 import { decodeEscapedHtml, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
+import { fontsForCanvas } from './fonts.ts'
+import { withFontFaces } from '../shared/fonts.ts'
+import { withWebFontLinks } from '../shared/webFonts.ts'
+import {
+  MAX_TOKENS,
+  MAX_TOKEN_DESCRIPTION,
+  MAX_TOKEN_THEMES,
+  aliasOf,
+  isThemeName,
+  isTokenName,
+  isTokenType,
+  normalizeTokenName,
+  normalizeTokenValue,
+  renameThemeAttrs,
+  resolveToken,
+  usesToken,
+  withTokenBlock,
+  type DesignToken,
+  type TokenEdit,
+  type TokenResult,
+  type TokenType,
+} from '../shared/designTokens.ts'
 import { emitCanvasEvent } from './events.ts'
 import type {
   Actor,
+  CanvasGuide,
   ActorKind,
   ActivityItem,
   AgentTask,
   CardScope,
-  ChatMessage,
   DesignDecision,
   ElementComment,
   Frame,
@@ -72,7 +93,6 @@ export function hydrateLogs(data: {
   tasks: Map<string, AgentTask[]>
   feedback: Map<string, TaskFeedback[]>
   comments: Map<string, ElementComment[]>
-  chat?: Map<string, ChatMessage[]>
   activity: Map<string, ActivityItem[]>
   decisions: Map<string, DesignDecision[]>
   proposals: Map<string, MemoryProposal[]>
@@ -80,8 +100,6 @@ export function hydrateLogs(data: {
   for (const [canvasId, list] of data.tasks) taskLog.set(canvasId, list)
   for (const [canvasId, list] of data.feedback) feedbackLog.set(canvasId, list)
   for (const [canvasId, list] of data.comments) commentLog.set(canvasId, list)
-  chatLog.clear()
-  for (const [canvasId, list] of data.chat ?? []) chatLog.set(canvasId, list)
   for (const [canvasId, list] of data.activity) activityLog.set(canvasId, list)
   for (const [canvasId, list] of data.decisions) decisionLog.set(canvasId, list)
   for (const [canvasId, list] of data.proposals) proposalLog.set(canvasId, list)
@@ -212,27 +230,58 @@ export function pendingWorkAgents(canvasId: string): string[] {
   return names
 }
 
+/** The oldest claimable item's requester and the connection it asked for. */
+export interface NextWork {
+  /** '' when the item predates per-user attribution */
+  payer: string
+  /** the card's pick; absent (and `key` '') for work on the Settings default */
+  runner?: RunnerPick
+  /** `payer` and the pick together: what one run claims, and what a sweep skips */
+  key: string
+}
+
+export function workKey(payer: string, runner: RunnerPick | undefined): string {
+  return `${payer}\n${runnerKey(runner)}`
+}
+
+/** Feedback runs on what the task it answers ran on, so a reply to a card
+ *  sent to the Claude Plan stays on the Claude Plan. The pick is kept on the
+ *  feedback itself; the task history is only asked for feedback left before
+ *  that, while its task is still there. */
+function feedbackRunner(f: TaskFeedback): RunnerPick | undefined {
+  return f.runner ?? (taskLog.get(f.canvasId) ?? []).find((t) => t.id === f.taskId)?.runner
+}
+
 /**
- * Who pays for the next run: the account behind the OLDEST piece of work this
- * agent can claim. A run bills exactly one person, so the queue is worked one
- * requester at a time rather than sweeping several people's work into a single
- * model call on whichever account happened to be found first.
+ * Who pays for the next run, and on what: the account behind the OLDEST piece
+ * of work this agent can claim, and the connection that work asked for. A run
+ * bills exactly one person and calls one model, so the queue is worked one
+ * requester and one connection at a time rather than sweeping several
+ * people's work into a single model call on whichever account happened to
+ * be found first.
  *
- * Returns '' when the oldest item predates per-user attribution (the caller
- * falls back to the canvas owner), and undefined when nothing is claimable.
- * `skip` holds payers already found to have no usable model this sweep, so one
- * stalled requester never blocks everyone behind them.
+ * `payer` is '' when the oldest item predates per-user attribution (the
+ * caller falls back to the canvas owner); the result is undefined when
+ * nothing is claimable. `skip` holds work keys already found to have no
+ * usable model this sweep, so one stalled requester never blocks everyone
+ * behind them.
  */
-export function nextWorkPayer(canvasId: string, agentName: string, skip?: ReadonlySet<string>): string | undefined {
-  let oldest: { at: number; payer: string } | undefined
-  const consider = (at: number, userId: string | undefined) => {
+export function nextWork(canvasId: string, agentName: string, skip?: ReadonlySet<string>): NextWork | undefined {
+  return oldestWork(canvasId, agentName, (work) => !!skip?.has(work.key))
+}
+
+/** The oldest claimable work the predicate does not pass over. */
+function oldestWork(canvasId: string, agentName: string, passOver: (work: NextWork) => boolean): NextWork | undefined {
+  let oldest: { at: number; work: NextWork } | undefined
+  const consider = (at: number, userId: string | undefined, runner: RunnerPick | undefined) => {
     const payer = userId ?? ''
-    if (skip?.has(payer)) return
-    if (!oldest || at < oldest.at) oldest = { at, payer }
+    const key = workKey(payer, runner)
+    if (passOver({ payer, key })) return
+    if (!oldest || at < oldest.at) oldest = { at, work: { payer, ...(runner ? { runner } : {}), key } }
   }
   for (const card of taskLog.get(canvasId) ?? []) {
     if (card.queuedBy && !card.agentName && !card.failedAt && !card.endedAt && stageAgent(card) === agentName) {
-      consider(card.startedAt, card.queuedByUserId)
+      consider(card.startedAt, card.queuedByUserId, card.runner)
     }
   }
   for (const c of commentLog.get(canvasId) ?? []) {
@@ -243,15 +292,21 @@ export function nextWorkPayer(canvasId: string, agentName: string, skip?: Readon
       !c.resolvedAt &&
       (c.targetAgent ?? roleName(DEFAULT_ROLE_ID)) === agentName
     ) {
-      consider(c.at, c.fromUserId)
+      consider(c.at, c.fromUserId, undefined)
     }
   }
   for (const f of feedbackLog.get(canvasId) ?? []) {
     if (!f.deliveredAt && !f.failedAt && (!f.targetAgent || f.targetAgent === agentName)) {
-      consider(f.at, f.fromUserId)
+      consider(f.at, f.fromUserId, feedbackRunner(f))
     }
   }
-  return oldest?.payer
+  return oldest?.work
+}
+
+/** The requester behind the oldest work, for callers that bill but do not
+ *  run; `skip` holds requesters (not work keys) who cannot pay. */
+export function nextWorkPayer(canvasId: string, agentName: string, skip?: ReadonlySet<string>): string | undefined {
+  return oldestWork(canvasId, agentName, (work) => !!skip?.has(work.payer))?.payer
 }
 
 /* ------------------------------------------------------------------ */
@@ -316,97 +371,6 @@ export function setAgentStatus(canvasId: string, actor: Actor, status: string) {
 
 const feedbackLog = new Map<string, TaskFeedback[]>() // canvasId -> entries (newest first)
 
-/* ---- canvas chat ---- */
-
-const chatLog = new Map<string, ChatMessage[]>() // canvasId -> messages (newest first)
-
-export const MAX_CHAT_CHARS = 4_000
-/** an agent's closing summary is a paragraph, not the whole transcript */
-const MAX_CHAT_REPLY_CHARS = 1_500
-
-export function getChat(canvasId: string): ChatMessage[] {
-  return chatLog.get(canvasId) ?? []
-}
-
-function pushChat(message: ChatMessage) {
-  const list = chatLog.get(message.canvasId) ?? []
-  list.unshift(message)
-  const dropped = list.splice(persist.CHAT_LOG_CAP).map((m) => m.id)
-  chatLog.set(message.canvasId, list)
-  persist.saveChat(message)
-  persist.deleteChat(dropped)
-  broadcast(message.canvasId, { type: 'chat', message })
-}
-
-/** A human says something in the canvas chat. @mentioning resident agents
- *  turns the message into a board card for them, in mention order — the
- *  message keeps the card's id so the chat can show where the work stands. */
-export function addChatMessage(
-  canvasId: string,
-  text: string,
-  from: string,
-  fromUserId?: string,
-): ChatMessage | undefined {
-  const clean = text.trim().slice(0, MAX_CHAT_CHARS)
-  if (!clean || !store.getCanvas(canvasId)) return undefined
-  const roles = mentionedRoles(clean)
-  const card =
-    roles.length > 0
-      ? addQueuedCard(
-          canvasId,
-          stripMentions(clean) || clean,
-          from,
-          roles.map((r) => r.id),
-          undefined,
-          fromUserId,
-        )
-      : undefined
-  const list = chatLog.get(canvasId) ?? []
-  const message: ChatMessage = {
-    id: nanoid(8),
-    canvasId,
-    from,
-    fromKind: 'user',
-    ...(fromUserId ? { fromUserId } : {}),
-    color: colorFor(from),
-    text: clean,
-    /* strictly increasing per canvas so the thread order survives a restart */
-    at: Math.max(Date.now(), (list[0]?.at ?? 0) + 1),
-    ...(roles.length > 0 ? { mentions: roles.map((r) => r.id) } : {}),
-    ...(card ? { taskId: card.id } : {}),
-  }
-  pushChat(message)
-  return message
-}
-
-/** An agent answers the chat message that queued one of its cards. Nothing
- *  is posted for cards that came from the board — those have no thread. */
-export function chatReplyForCard(
-  canvasId: string,
-  cardId: string,
-  actor: Actor,
-  text: string,
-): ChatMessage | undefined {
-  const asked = (chatLog.get(canvasId) ?? []).find((m) => m.taskId === cardId && m.fromKind === 'user')
-  if (!asked) return undefined
-  const clean = text.replace(/\s+/g, ' ').trim()
-  if (!clean) return undefined
-  const list = chatLog.get(canvasId) ?? []
-  const message: ChatMessage = {
-    id: nanoid(8),
-    canvasId,
-    from: actor.name,
-    fromKind: 'agent',
-    color: actor.color,
-    text: clean.length > MAX_CHAT_REPLY_CHARS ? clean.slice(0, MAX_CHAT_REPLY_CHARS - 1) + '…' : clean,
-    at: Math.max(Date.now(), (list[0]?.at ?? 0) + 1),
-    taskId: cardId,
-    replyToId: asked.id,
-  }
-  pushChat(message)
-  return message
-}
-
 export function getFeedback(canvasId: string): TaskFeedback[] {
   return feedbackLog.get(canvasId) ?? []
 }
@@ -442,6 +406,7 @@ export function addTaskFeedback(
       ...(target ? { targetAgent: target } : {}),
       from,
       ...(fromUserId ? { fromUserId } : {}),
+      ...(task.runner ? { runner: task.runner } : {}),
       text: clean,
       at: Date.now(),
     }
@@ -464,17 +429,25 @@ export function addTaskFeedback(
   return undefined
 }
 
-/** Open feedback this agent may take: everything addressed to it, plus
- *  untargeted feedback — that part stays a canvas-level queue where the first
- *  identified agent call wins. */
-export function takeFeedbackFor(canvasId: string, agentName: string, payer?: string): TaskFeedback[] {
-  const pending = (feedbackLog.get(canvasId) ?? []).filter(
+/** The feedback takeFeedbackFor would claim, left unclaimed: what read-only
+ *  tools mention without assigning anything. */
+export function openFeedbackFor(canvasId: string, agentName: string, payer?: string, runner?: string): TaskFeedback[] {
+  return (feedbackLog.get(canvasId) ?? []).filter(
     (f) =>
       !f.deliveredAt &&
       !f.failedAt &&
       (!f.targetAgent || f.targetAgent === agentName) &&
-      (payer === undefined || (f.fromUserId ?? '') === payer),
+      (payer === undefined || (f.fromUserId ?? '') === payer) &&
+      (runner === undefined || runnerKey(feedbackRunner(f)) === runner),
   )
+}
+
+/** Open feedback this agent may take: everything addressed to it, plus
+ *  untargeted feedback — that part stays a canvas-level queue where the first
+ *  identified agent call wins. `runner` (a `runnerKey`) narrows the claim to
+ *  one connection, since a run calls one model. */
+export function takeFeedbackFor(canvasId: string, agentName: string, payer?: string, runner?: string): TaskFeedback[] {
+  const pending = openFeedbackFor(canvasId, agentName, payer, runner)
   for (const f of pending) {
     f.deliveredAt = Date.now()
     f.claimedBy = agentName
@@ -538,9 +511,9 @@ export function retryTaskFeedback(feedbackId: string, by: string): TaskFeedback 
 }
 
 /* ------------------------------------------------------------------ */
-/* Element comments: pinned to a specific element inside a frame.      */
-/* Comments mentioning @Doop are routed to the resident agent; the     */
-/* rest are notes for the humans in the room.                          */
+/* Comments: pinned to a specific element inside a frame, or to a      */
+/* point on the canvas. Comments mentioning @Doop are routed to the    */
+/* resident agent; the rest are notes for the humans in the room.      */
 /* ------------------------------------------------------------------ */
 
 const commentLog = new Map<string, ElementComment[]>() // canvasId -> entries (newest first)
@@ -558,25 +531,337 @@ export function findComment(commentId: string): ElementComment | undefined {
   return undefined
 }
 
-export function addElementComment(
+/** Where a new comment sits: on an element inside a frame (by its
+ *  `data-doop-id`), on a frame as a whole at a design point, or at a world
+ *  point on one page of the canvas. */
+type CommentAnchor =
+  | {
+      frame: Frame
+      elementId?: string
+      snippet: string
+      point?: { x: number; y: number }
+      elementOrigin?: { x: number; y: number }
+    }
+  | { pageId: string; x: number; y: number }
+
+/** What a client knows about the element it is pointing at: the positional
+ *  path the live document answered with, the id the element already wears if
+ *  any, an excerpt, and the design point of the click. */
+export interface FrameAnchorInput {
+  selector?: unknown
+  elementId?: unknown
+  snippet?: unknown
+  x?: unknown
+  y?: unknown
+  elementOrigin?: unknown
+}
+
+export const MAX_ELEMENT_SELECTOR_CHARS = 1_000
+
+/* Stamps that are in a frame's HTML in memory but not yet known to be on
+   disk, per frame: the write that carries them, while one is out. An id is
+   handed out only once its frame write has landed, whichever request made
+   it and whether or not that first write failed. */
+const unsavedStamps = new Map<string, { ids: Set<string>; write?: Promise<void> }>()
+
+/** Resolves true once `id` is in a stored copy of the frame: at once for an
+ *  id that was never pending, else after the write that carries it (a write
+ *  already out is waited for; one that failed is retried once by this
+ *  caller). False when the frame is gone or the write fails. */
+async function stampSaved(frameId: string, id: string): Promise<boolean> {
+  let tried = false
+  for (;;) {
+    const pending = unsavedStamps.get(frameId)
+    if (!pending?.ids.has(id)) return true
+    if (pending.write) {
+      await pending.write
+      continue
+    }
+    const frame = store.getFrame(frameId)
+    if (tried || !frame) return false
+    tried = true
+    /* the row is taken from the frame as it is now: every stamp so far goes in */
+    const carried = new Set(pending.ids)
+    const write: Promise<void> = persist
+      .saveFrameNow(frame)
+      .then(
+        () => {
+          /* deleted while the write was out: the write must not bring it back */
+          if (!store.getFrame(frameId)) persist.deleteFrame(frameId)
+          for (const stamp of carried) pending.ids.delete(stamp)
+          if (!pending.ids.size && unsavedStamps.get(frameId) === pending) unsavedStamps.delete(frameId)
+        },
+        (err: unknown) => {
+          console.error(`[comments] element id stamp on frame ${frameId} not written:`, err)
+        },
+      )
+      .finally(() => {
+        if (pending.write === write) pending.write = undefined
+      })
+    pending.write = write
+  }
+}
+
+/** Make the element a positional selector names addressable by id: the id
+ *  it already carries, or a fresh `data-doop-id` written into the frame's
+ *  HTML as an annotation (sign-off stands, no design-history version, no
+ *  activity line). Whatever names the id (a comment, a copied link) is
+ *  written after this returns, so the frame carrying it is on disk first.
+ *  Undefined when the frame is gone, is being streamed into, the selector
+ *  does not resolve in the stored HTML, or the stamp cannot be written (it
+ *  then stays in memory, unnamed, and goes to disk with a later save). */
+export async function ensureElementId(
   frameId: string,
-  input: { selector: string; snippet: string; text: string },
+  selector: string,
+  by: string,
+  /** the live element's excerpt, when known: the stamp is refused if the
+   *  saved element at that path is not the one the client saw */
+  like?: string,
+): Promise<{ id: string; frame: Frame } | undefined> {
+  const frame = store.getFrame(frameId)
+  if (!frame || isFrameStreaming(frameId)) return undefined
+  const stamped = stampElementId(frame.html, selector.slice(0, MAX_ELEMENT_SELECTOR_CHARS), { like })
+  if (!stamped) return undefined
+  if (stamped.html === frame.html) {
+    if (!(await stampSaved(frameId, stamped.id))) return undefined
+    /* the frame may have been deleted while the write was awaited */
+    const current = store.getFrame(frameId)
+    return current ? { id: stamped.id, frame: current } : undefined
+  }
+  const next = store.updateFrame(frameId, { html: stamped.html }, by, { annotation: true })
+  if (!next) return undefined
+  const pending = unsavedStamps.get(frameId) ?? { ids: new Set<string>() }
+  pending.ids.add(stamped.id)
+  unsavedStamps.set(frameId, pending)
+  if (!(await stampSaved(frameId, stamped.id))) return undefined
+  /* deleted meanwhile: an update now would put it back on every screen */
+  if (!store.getFrame(frameId)) return undefined
+  broadcast(next.canvasId, { type: 'frame:updated', frame: next, actor: resolveActor({ name: by, kind: 'user' }) })
+  return { id: stamped.id, frame: next }
+}
+
+/** An anchor inside a frame, as a client sent it. An element is kept by the
+ *  id it carries, else stamped from the positional selector; when neither
+ *  works (the element came from a script, or the frame is mid-stream) the
+ *  comment lands on the frame at the point instead, so it is never lost. A
+ *  client that sends no point (older apps) still gets a frame comment, one
+ *  that is listed without a pin. */
+async function frameAnchor(frame: Frame, input: FrameAnchorInput, by: string): Promise<CommentAnchor> {
+  const point =
+    Number.isFinite(input.x) && Number.isFinite(input.y) ? { x: Number(input.x), y: Number(input.y) } : undefined
+  const origin = input.elementOrigin
+  const elementOrigin =
+    point &&
+    origin &&
+    typeof origin === 'object' &&
+    'x' in origin &&
+    'y' in origin &&
+    Number.isFinite(origin.x) &&
+    Number.isFinite(origin.y)
+      ? { x: Number(origin.x), y: Number(origin.y) }
+      : undefined
+  const placement = { ...(point ? { point } : {}), ...(elementOrigin ? { elementOrigin } : {}) }
+  const snippet = String(input.snippet ?? '').slice(0, 400)
+  const selector = String(input.selector ?? '').trim()
+  const onElement = selector !== '' && selector !== FRAME_COMMENT_SELECTOR
+  if (
+    isElementId(input.elementId) &&
+    hasElementId(frame.html, input.elementId) &&
+    (await stampSaved(frame.id, input.elementId))
+  ) {
+    return { frame, elementId: input.elementId, snippet, ...placement }
+  }
+  if (onElement) {
+    const stamped = await ensureElementId(frame.id, selector, by, snippet || undefined)
+    if (stamped) return { frame: stamped.frame, elementId: stamped.id, snippet, ...placement }
+  }
+  return { frame, snippet: '', ...(point ? { point } : {}) }
+}
+
+export async function addElementComment(
+  frameId: string,
+  input: FrameAnchorInput & { text: string },
+  from: string,
+  fromUserId?: string,
+): Promise<ElementComment | undefined> {
+  const frame = store.getFrame(frameId)
+  if (!frame || !input.text.trim()) return undefined
+  const anchor = await frameAnchor(frame, input, from)
+  /* a frame deleted while its element was being stamped takes no comment */
+  if (!store.getFrame(frameId)) return undefined
+  return postComment(frame.canvasId, anchor, input.text, from, fromUserId)
+}
+
+/** The anchor as it is written onto a comment; what the anchor does not
+ *  carry is absent, so a moved comment sheds its old frame, element or page. */
+function anchorFields(
+  anchor: CommentAnchor,
+): Pick<ElementComment, 'frameId' | 'elementId' | 'snippet' | 'pageId' | 'x' | 'y' | 'elementOrigin'> {
+  if ('frame' in anchor) {
+    return {
+      frameId: anchor.frame.id,
+      ...(anchor.elementId ? { elementId: anchor.elementId } : {}),
+      snippet: anchor.snippet,
+      ...anchor.point,
+      ...(anchor.elementOrigin ? { elementOrigin: anchor.elementOrigin } : {}),
+    }
+  }
+  return { snippet: '', pageId: anchor.pageId, x: anchor.x, y: anchor.y }
+}
+
+/** Comments anchored by a positional CSS path before element ids existed:
+ *  stamp each element and keep the comment on it. Runs once after boot, frame
+ *  by frame: every stamp for a frame is written and awaited before the
+ *  comments naming those ids are, so a crash in between leaves selectors to
+ *  retry, never a comment pointing at an id no frame carries. A path that no
+ *  longer resolves spends its selector and leaves a lost anchor (frame and
+ *  snippet, no pin): HTML only drifts further, so retrying it would not help.
+ *  A malformed selector, a frame that will not parse or a failed write is
+ *  logged and left for the next boot; one bad row never stops the others.
+ *  The comments are in memory and displayed throughout; pins appear as the
+ *  stamps land, with the frames broadcast to anyone already in the room. */
+export async function backfillElementIds(
+  legacy: Map<string, string>,
+): Promise<{ stamped: number; lost: number; failed: number }> {
+  const byFrame = new Map<string, Array<{ comment: ElementComment; selector: string }>>()
+  for (const [commentId, selector] of legacy) {
+    const comment = findComment(commentId)
+    if (!comment?.frameId || !store.getFrame(comment.frameId)) continue
+    const list = byFrame.get(comment.frameId) ?? []
+    list.push({ comment, selector })
+    byFrame.set(comment.frameId, list)
+  }
+  const counts = { stamped: 0, lost: 0, failed: 0 }
+  for (const [frameId, rows] of byFrame) {
+    const found: Array<{ comment: ElementComment; id: string }> = []
+    const lost: ElementComment[] = []
+    /* one frame's canvas at a time; the idle sweep gives it back afterwards */
+    let html = (await store.loadFrame(frameId))?.html
+    if (html === undefined) continue
+    for (const { comment, selector } of rows) {
+      try {
+        const result = stampElementId(html, selector)
+        if (result) {
+          html = result.html
+          found.push({ comment, id: result.id })
+        } else lost.push(comment)
+      } catch (err) {
+        counts.failed++
+        console.error(`[comments] element id backfill: comment ${comment.id} on frame ${frameId}:`, err)
+      }
+    }
+    try {
+      const frame = store.getFrame(frameId)
+      if (frame && html !== frame.html) {
+        const next = store.updateFrame(frameId, { html }, frame.updatedBy, { annotation: true })
+        if (!next) continue
+        await persist.saveFrameNow(next)
+        broadcast(next.canvasId, {
+          type: 'frame:updated',
+          frame: next,
+          actor: resolveActor({ name: next.updatedBy, kind: 'user' }),
+        })
+      }
+      for (const { comment, id } of found) {
+        if (reanchored(comment)) continue
+        comment.elementId = id
+        await persist.saveCommentNow(comment)
+        broadcast(comment.canvasId, { type: 'comment', comment })
+        counts.stamped++
+      }
+      for (const comment of lost) {
+        if (reanchored(comment)) continue
+        await persist.saveCommentNow(comment)
+        counts.lost++
+      }
+    } catch (err) {
+      counts.failed += found.length + lost.length
+      console.error(`[comments] element id backfill: frame ${frameId} not written, left for the next boot:`, err)
+    }
+  }
+  return counts
+}
+
+/* a thread moved while the backfill awaited a write: the move replaced the
+   comment in the log and saved its new anchor (spending the selector), so
+   the object the backfill holds is stale and writing it would undo the move */
+function reanchored(comment: ElementComment): boolean {
+  return findComment(comment.id) !== comment
+}
+
+/** Re-pin a thread where its root pin was dropped: on an element, on a
+ *  frame as a whole or on the canvas, on any frame of the same canvas. The
+ *  root and its replies move together, since replies inherit the anchor.
+ *  Undefined when the comment, the frame or the page is not there. */
+export async function moveComment(
+  commentId: string,
+  input: CommentAnchorInput,
+  by: string,
+): Promise<ElementComment | undefined> {
+  const found = findComment(commentId)
+  if (!found) return undefined
+  const root = found.parentId ? findComment(found.parentId) : found
+  if (!root) return undefined
+  const canvas = store.getCanvas(root.canvasId)
+  if (!canvas) return undefined
+  let anchor: CommentAnchor
+  if ('frameId' in input) {
+    const frame = store.getFrame(input.frameId)
+    if (!frame || frame.canvasId !== root.canvasId) return undefined
+    anchor = await frameAnchor(frame, input, by)
+    if (!store.getFrame(frame.id)) return undefined
+  } else {
+    if (!canvasPages(canvas).some((page) => page.id === input.pageId)) return undefined
+    anchor = { pageId: input.pageId, x: input.x, y: input.y }
+  }
+  const fields = anchorFields(anchor)
+  const list = commentLog.get(root.canvasId) ?? []
+  let moved = root
+  list.forEach((c, i) => {
+    if (c.id !== root.id && c.parentId !== root.id) return
+    const {
+      frameId: _frameId,
+      elementId: _elementId,
+      elementOrigin: _elementOrigin,
+      pageId: _pageId,
+      x: _x,
+      y: _y,
+      ...rest
+    } = c
+    const next: ElementComment = { ...rest, ...fields }
+    list[i] = next
+    if (c.id === root.id) moved = next
+    persist.saveComment(next)
+    broadcast(root.canvasId, { type: 'comment', comment: next })
+  })
+  const frame = 'frame' in anchor ? anchor.frame : undefined
+  logActivity(
+    root.canvasId,
+    resolveActor({ name: by, kind: 'user' }),
+    frame ? `moved a comment to “${frame.name}”` : 'moved a comment onto the canvas',
+    frame?.id,
+  )
+  return moved
+}
+
+/** A comment pinned to a point on the canvas (world coordinates on one of
+ *  its pages) rather than to an element — a note about the layout, a gap
+ *  between frames, or a spot where something should go. */
+export function addCanvasComment(
+  canvasId: string,
+  input: { pageId: string; x: number; y: number; text: string },
   from: string,
   fromUserId?: string,
 ): ElementComment | undefined {
-  const frame = store.getFrame(frameId)
-  if (!frame) return undefined
-  return postComment(
-    frame,
-    { selector: String(input.selector ?? '').slice(0, 300), snippet: String(input.snippet ?? '').slice(0, 400) },
-    input.text,
-    from,
-    fromUserId,
-  )
+  const canvas = store.getCanvas(canvasId)
+  if (!canvas || !canvasPages(canvas).some((page) => page.id === input.pageId)) return undefined
+  if (!Number.isFinite(input.x) || !Number.isFinite(input.y)) return undefined
+  return postComment(canvasId, { pageId: input.pageId, x: input.x, y: input.y }, input.text, from, fromUserId)
 }
 
-/** Reply inside a thread: the reply inherits the root comment's element so an
- *  @mention in it gives the agent the same anchor the conversation is about. */
+/** Reply inside a thread: the reply inherits the root comment's anchor (its
+ *  element, or its point on the canvas) so an @mention in it gives the agent
+ *  the same anchor the conversation is about. */
 export function replyToComment(
   commentId: string,
   text: string,
@@ -586,80 +871,93 @@ export function replyToComment(
 ): ElementComment | undefined {
   const open = openThread(commentId)
   if (!open) return undefined
-  const { root, frame } = open
-  return postComment(
-    frame,
-    { selector: root.selector, snippet: root.snippet, parentId: root.id },
-    text,
-    from,
-    fromUserId,
-    kind,
-  )
+  const anchor = replyAnchor(open)
+  if (!anchor) return undefined
+  return postComment(open.root.canvasId, anchor, text, from, fromUserId, kind, open.root.id)
 }
 
-/** The root and frame a reply to this comment would land on, or undefined
- *  when the thread is resolved or its frame is gone — checked before any
- *  metering so a rejected reply never costs a resident task. */
-export function openThread(commentId: string): { root: ElementComment; frame: Frame } | undefined {
+function replyAnchor({ root, frame }: { root: ElementComment; frame?: Frame }): CommentAnchor | undefined {
+  if (frame) {
+    const point = root.x !== undefined && root.y !== undefined ? { point: { x: root.x, y: root.y } } : {}
+    return {
+      frame,
+      ...(root.elementId ? { elementId: root.elementId } : {}),
+      snippet: root.snippet,
+      ...point,
+      ...(root.elementOrigin ? { elementOrigin: root.elementOrigin } : {}),
+    }
+  }
+  return isCanvasComment(root) ? { pageId: root.pageId, x: root.x, y: root.y } : undefined
+}
+
+/** The root a reply to this comment would land under, with its frame when
+ *  it is an element comment (a canvas comment has none), or undefined when
+ *  the thread is resolved or its frame is gone — checked before any metering
+ *  so a rejected reply never costs a resident task. */
+export function openThread(commentId: string): { root: ElementComment; frame?: Frame } | undefined {
   const parent = findComment(commentId)
   if (!parent) return undefined
   const root = parent.parentId ? findComment(parent.parentId) : parent
   if (!root || root.resolvedAt) return undefined
-  const frame = store.getFrame(root.frameId)
+  if (isCanvasComment(root)) return { root }
+  const frame = root.frameId ? store.getFrame(root.frameId) : undefined
   if (!frame) return undefined
   return { root, frame }
 }
 
 function postComment(
-  frame: Frame,
-  anchor: { selector: string; snippet: string; parentId?: string },
+  canvasId: string,
+  anchor: CommentAnchor,
   text: string,
   from: string,
   fromUserId?: string,
   kind: ActorKind = 'user',
+  parentId?: string,
 ): ElementComment | undefined {
   const clean = text.trim()
   if (!clean) return undefined
   /* @Doop, @brand, @a11y… — whichever resident agent is mentioned picks it up */
   const mentioned = mentionedRole(clean)
-  const list = commentLog.get(frame.canvasId) ?? []
+  const list = commentLog.get(canvasId) ?? []
   /* strictly increasing per canvas: thread order is reconstructed from `at`
      after a restart, so two messages must never share a timestamp */
   const at = Math.max(Date.now(), (list[0]?.at ?? 0) + 1)
+  const frame = 'frame' in anchor ? anchor.frame : undefined
   const comment: ElementComment = {
     id: nanoid(8),
-    canvasId: frame.canvasId,
-    frameId: frame.id,
-    selector: anchor.selector,
-    snippet: anchor.snippet,
+    canvasId,
+    ...anchorFields(anchor),
     from,
     ...(fromUserId ? { fromUserId } : {}),
     text: clean,
     at,
     ...(mentioned ? { forAgent: true, targetAgent: mentioned.name } : {}),
-    ...(anchor.parentId ? { parentId: anchor.parentId } : {}),
+    ...(parentId ? { parentId } : {}),
   }
   list.unshift(comment)
   if (list.length > 100) list.length = 100
-  commentLog.set(frame.canvasId, list)
+  commentLog.set(canvasId, list)
   persist.saveComment(comment)
-  broadcast(frame.canvasId, { type: 'comment', comment })
+  broadcast(canvasId, { type: 'comment', comment })
   const excerpt = clean.length > 80 ? clean.slice(0, 77) + '…' : clean
+  const where = frame ? `in “${frame.name}”` : 'on the canvas'
   logActivity(
-    frame.canvasId,
+    canvasId,
     resolveActor({ name: from, kind }),
-    anchor.parentId
-      ? `replied to a comment in “${frame.name}”: “${excerpt}”`
-      : `commented on an element in “${frame.name}”: “${excerpt}”`,
-    frame.id,
+    parentId
+      ? `replied to a comment ${where}: “${excerpt}”`
+      : frame
+        ? `commented on an element in “${frame.name}”: “${excerpt}”`
+        : `commented on the canvas: “${excerpt}”`,
+    frame?.id,
   )
   if (comment.forAgent) {
     /* @Doop mention: the resident agent picks it up instantly (no-op without
        an API key). Dynamic import: resident depends on this module. */
-    import('./resident.ts').then((r) => r.onFeedback(frame.canvasId)).catch(() => {})
+    import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
   }
-  emitCanvasEvent(frame.canvasId, {
-    type: anchor.parentId ? 'comment.replied' : 'comment.created',
+  emitCanvasEvent(canvasId, {
+    type: parentId ? 'comment.replied' : 'comment.created',
     comment,
     frame,
     actorKind: kind,
@@ -679,7 +977,15 @@ export function commentThread(comment: ElementComment): ElementComment[] {
 }
 
 /** Open comments @mentioning this agent, claimed by it. */
-export function takeAgentCommentsFor(canvasId: string, agentName: string, payer?: string): ElementComment[] {
+/** A comment carries no pick, so it is claimed only by a run on the
+ *  Settings default (`runner` '' or unset). */
+export function takeAgentCommentsFor(
+  canvasId: string,
+  agentName: string,
+  payer?: string,
+  runner?: string,
+): ElementComment[] {
+  if (runner) return []
   const pending = (commentLog.get(canvasId) ?? []).filter(
     (c) =>
       c.forAgent &&
@@ -722,8 +1028,32 @@ export function retryComment(commentId: string, by: string): ElementComment | un
     delete comment.failureReason
     persist.saveComment(comment)
     broadcast(canvasId, { type: 'comment', comment })
-    logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), 'retried an element comment', comment.frameId)
+    logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), 'retried a comment', comment.frameId)
     import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
+    return comment
+  }
+  return undefined
+}
+
+/**
+ * The agent answered a request with a question: the request is handed back
+ * to the person as an ordinary open thread (no claim, no agent status), so
+ * their answer — an @mention reply — queues fresh work with the whole
+ * conversation, and nothing is resolved behind their back.
+ */
+export function handBackComment(commentId: string, by: string): ElementComment | undefined {
+  for (const [canvasId, list] of commentLog) {
+    const comment = list.find((c) => c.id === commentId)
+    if (!comment || comment.resolvedAt) continue
+    delete comment.claimedBy
+    delete comment.claimedAt
+    delete comment.failedAt
+    delete comment.failureReason
+    delete comment.forAgent
+    delete comment.targetAgent
+    persist.saveComment(comment)
+    broadcast(canvasId, { type: 'comment', comment })
+    logActivity(canvasId, resolveActor({ name: by, kind: 'agent' }), 'asked a question in a comment', comment.frameId)
     return comment
   }
   return undefined
@@ -754,7 +1084,12 @@ export function resolveComment(commentId: string, by: string): ElementComment | 
         })
       }
     }
-    emitCanvasEvent(canvasId, { type: 'comment.resolved', comment: c, frame: store.getFrame(c.frameId), by })
+    emitCanvasEvent(canvasId, {
+      type: 'comment.resolved',
+      comment: c,
+      frame: c.frameId ? store.getFrame(c.frameId) : undefined,
+      by,
+    })
     return c
   }
   return undefined
@@ -872,11 +1207,13 @@ export function addQueuedCard(
   attachments?: unknown,
   fromUserId?: string,
   scope?: unknown,
+  runner?: unknown,
 ): AgentTask | undefined {
   const clean = title.trim().slice(0, MAX_CARD_CHARS)
   if (!clean || !store.getCanvas(canvasId)) return undefined
   const pipeline = normalizePipeline(agents)
   const target = normalizeScope(canvasId, scope)
+  const pick = parseRunnerPick(runner)
   /* reference-image frame ids: only frames that actually live on this canvas */
   const refs = (Array.isArray(attachments) ? attachments : [])
     .filter((a): a is string => typeof a === 'string')
@@ -890,7 +1227,8 @@ export function addQueuedCard(
       t.status === clean &&
       pipelineOf(t).join(',') === pipeline.join(',') &&
       (t.attachments ?? []).join(',') === refs.join(',') &&
-      JSON.stringify(t.scope ?? null) === JSON.stringify(target ?? null),
+      JSON.stringify(t.scope ?? null) === JSON.stringify(target ?? null) &&
+      runnerKey(t.runner) === runnerKey(pick),
   )
   if (duplicate) return duplicate
   const card: AgentTask = {
@@ -905,6 +1243,7 @@ export function addQueuedCard(
     stage: 0,
     ...(refs.length > 0 ? { attachments: refs } : {}),
     ...(target ? { scope: target } : {}),
+    ...(pick ? { runner: pick } : {}),
   }
   list.unshift(card)
   taskLog.set(canvasId, trimTaskLog(list))
@@ -1035,7 +1374,9 @@ export function addRepoCards(canvasId: string, input: RepoImportInput, from: str
 
 /** Cards waiting on THIS agent's stage, claimed by it. A card at another
  *  stage is invisible here — that is what keeps a pipeline in order. */
-export function takeQueuedCardsFor(canvasId: string, agentName: string, payer?: string): AgentTask[] {
+/** `runner` (a `runnerKey`) narrows the claim to cards sent to one
+ *  connection; unset takes them all. */
+export function takeQueuedCardsFor(canvasId: string, agentName: string, payer?: string, runner?: string): AgentTask[] {
   const pending = (taskLog.get(canvasId) ?? []).filter(
     (t) =>
       t.queuedBy &&
@@ -1043,7 +1384,8 @@ export function takeQueuedCardsFor(canvasId: string, agentName: string, payer?: 
       !t.failedAt &&
       !t.endedAt &&
       stageAgent(t) === agentName &&
-      (payer === undefined || (t.queuedByUserId ?? '') === payer),
+      (payer === undefined || (t.queuedByUserId ?? '') === payer) &&
+      (runner === undefined || runnerKey(t.runner) === runner),
   )
   for (const c of pending) {
     c.agentName = agentName
@@ -1059,7 +1401,8 @@ export function takeQueuedCardsFor(canvasId: string, agentName: string, payer?: 
  *  pipeline, or complete it if that was the last one. */
 export function advanceCard(canvasId: string, cardId: string, by: Actor): AgentTask | undefined {
   const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card || card.endedAt) return card
+  /* a card stopped while its run went on stays stopped */
+  if (!card || card.endedAt || card.failedAt) return card
   const pipeline = pipelineOf(card)
   const next = (card.stage ?? 0) + 1
   if (next >= pipeline.length) return completeCard(canvasId, cardId)
@@ -1097,6 +1440,18 @@ export function failCard(canvasId: string, cardId: string, reason: string): Agen
   persist.saveTask(canvasId, card)
   broadcast(canvasId, { type: 'task', task: card })
   emitCanvasEvent(canvasId, { type: 'task.failed', task: card, reason })
+  /* a run whose every card is now failed lets go of its model call at once */
+  import('./resident.ts').then((r) => r.onCardStopped(canvasId)).catch(() => {})
+  return card
+}
+
+/** A person stops a card, waiting or mid-run. It pauses like any failed card,
+ *  so Retry starts it over. */
+export function stopCard(canvasId: string, cardId: string, by: string): AgentTask | undefined {
+  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
+  if (!card || card.endedAt || card.failedAt) return card
+  failCard(canvasId, cardId, `Stopped by ${by}.`)
+  logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `stopped a card: “${card.status}”`)
   return card
 }
 
@@ -1113,6 +1468,102 @@ export function retryCard(canvasId: string, cardId: string, by: string): AgentTa
   logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `retried a card: “${card.status}”`)
   import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
   return card
+}
+
+/* ------------------------------------------------------------------ */
+/* Design history: a frame's HTML history is kept per BURST of edits,  */
+/* not per write — a stream's chunks, an agent's tweak right after its  */
+/* redesign, a human typing in the Inspector are each one burst. What  */
+/* gets snapshotted is the state a burst starts from (where the burst  */
+/* before it ended), so an agent's one-shot replace or stream can never */
+/* leave itself as the only copy of a design. A full replace always    */
+/* opens a burst; a small tweak joins the open one when the same actor */
+/* made it within BURST_IDLE_MS.                                        */
+/* ------------------------------------------------------------------ */
+
+interface Burst {
+  actor: Actor
+  /** when this actor last wrote the frame's HTML */
+  lastAt: number
+}
+
+const bursts = new Map<string, Burst>() // frameId -> the burst open on it
+const BURST_IDLE_MS = 2 * 60_000
+
+type PriorState = Pick<Frame, 'id' | 'canvasId' | 'html' | 'width' | 'height' | 'updatedAt' | 'updatedBy'>
+
+/** The store mutates frames in place, so what a write replaces has to be
+ *  captured before the write. */
+function priorState(f: Frame): PriorState {
+  const { id, canvasId, html, width, height, updatedAt, updatedBy } = f
+  return { id, canvasId, html, width, height, updatedAt, updatedBy }
+}
+
+/** Record that `actor` has just replaced the frame's HTML. `tweak` marks a
+ *  small edit that may join the open burst; anything else starts a new one
+ *  and files the state it replaced as a version. */
+function noteHtmlChange(prior: PriorState, actor: Actor, tweak: boolean) {
+  const open = bursts.get(prior.id)
+  const now = Date.now()
+  const joins =
+    tweak &&
+    open !== undefined &&
+    open.actor.name === actor.name &&
+    open.actor.kind === actor.kind &&
+    now - open.lastAt < BURST_IDLE_MS
+  bursts.set(prior.id, { actor, lastAt: now })
+  if (joins || !prior.html) return
+  /* the open burst wrote this state; without one (first write since boot)
+     the frame's own stamp is the best attribution there is, even though a
+     move or rename since may have refreshed it */
+  persist.saveFrameVersion({
+    id: nanoid(10),
+    frameId: prior.id,
+    canvasId: prior.canvasId,
+    html: prior.html,
+    width: prior.width,
+    height: prior.height,
+    savedAt: open?.lastAt ?? prior.updatedAt,
+    savedBy: open?.actor.name ?? prior.updatedBy,
+    savedByKind: open?.actor.kind,
+    htmlBytes: prior.html.length,
+  })
+}
+
+export type RestoredFrame = {
+  frame: Frame
+  /** the complete state the restore replaced — a client mid-reveal only
+   *  holds a partial copy, so this is what its undo must put back */
+  replaced: Pick<Frame, 'html' | 'width' | 'height'>
+}
+
+/** Put a frame back to one of its recorded versions (HTML and size; the name
+ *  and position stay). null = no such version on this frame. The state being
+ *  replaced is filed as a version first, so a restore is itself reversible. */
+export async function restoreFrameVersion(
+  frameId: string,
+  versionId: string,
+  actor: Actor,
+): Promise<RestoredFrame | null | undefined> {
+  const version = await persist.getFrameVersion(frameId, versionId)
+  if (!version) return null
+  const before = store.getFrame(frameId)
+  if (!before) return undefined
+  const replaced = { html: before.html, width: before.width, height: before.height }
+  if (before.html === version.html && before.width === version.width && before.height === version.height)
+    return { frame: before, replaced }
+  /* whoever restores takes over: any live stream or playback ends */
+  finishStream(frameId, false)
+  finishReveal(frameId)
+  const prior = priorState(before)
+  const patch = { html: version.html, width: version.width, height: version.height }
+  const frame = store.updateFrame(frameId, patch, actor.name)
+  if (!frame) return undefined
+  noteHtmlChange(prior, actor, false)
+  broadcast(frame.canvasId, { type: 'frame:updated', frame, actor })
+  logActivity(frame.canvasId, actor, `restored “${frame.name}” to an earlier version by ${version.savedBy}`, frame.id)
+  touch(frame.canvasId, actor, frame.id)
+  return { frame, replaced }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1180,6 +1631,18 @@ function commonPrefixLen(a: string, b: string): number {
   return i
 }
 
+/** Where two documents diverge, and how much they share at the start plus
+ *  the end. An edit in one spot (a find/replace, typing in one element)
+ *  leaves nearly everything shared however early in the document it sits;
+ *  only a rewrite scores low. */
+function sharedSpan(a: string, b: string): { prefix: number; shared: number } {
+  const prefix = commonPrefixLen(a, b)
+  const room = Math.min(a.length, b.length) - prefix
+  let suffix = 0
+  while (suffix < room && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++
+  return { prefix, shared: prefix + suffix }
+}
+
 function startReveal(frame: Frame, actor: Actor, shown: number) {
   reveals.set(frame.id, { actor, shown, deadline: Date.now() + revealDuration(frame.html.length - shown) })
   broadcast(frame.canvasId, { type: 'frame:streaming', frameId: frame.id, active: true, actor })
@@ -1199,8 +1662,26 @@ function finishStream(frameId: string, logDone: boolean) {
   const s = streams.get(frameId)
   if (!s) return
   streams.delete(frameId)
-  const frame = store.getFrame(frameId)
-  if (!frame) return
+  const current = store.getFrame(frameId)
+  if (!current) return
+  /* a stream that ends without its done chunk (the agent went idle, or a
+     replace cut it off) still gets the faces of the library fonts it uses;
+     a finished one already has them, and this is then a no-op */
+  let renamed = current.html
+  for (const rename of pendingRenames.get(frameId) ?? []) renamed = applyRename(renamed, rename)
+  pendingRenames.delete(frameId)
+  const html = withLibraryFaces(current.canvasId, renamed)
+  /* compare the HTML, not the objects: updateFrame edits the frame in place */
+  const htmlChanged = html !== current.html
+  const frame = htmlChanged ? store.updateFrame(frameId, { html }, s.actor.name)! : current
+  /* the store keeps what arrived; viewers get it healed, like every chunk,
+     so a script cut off mid-way never runs in their frames */
+  if (htmlChanged)
+    broadcast(frame.canvasId, {
+      type: 'frame:updated',
+      frame: { ...frame, html: healPartialHtml(frame.html) },
+      actor: s.actor,
+    })
   broadcast(frame.canvasId, { type: 'frame:streaming', frameId, active: false, actor: s.actor })
   if (logDone) logActivity(frame.canvasId, s.actor, `finished designing “${frame.name}”`, frameId)
   endAutoTask(frame.canvasId, s.actor)
@@ -1235,6 +1716,19 @@ setInterval(() => {
   }
 }, TICK_MS)
 
+/** A finished document with the @font-face rules for the canvas's library
+ *  fonts it uses (shared/fonts.ts) and the stylesheet link for the hosted
+ *  fonts it names (shared/webFonts.ts), so naming a family is all it takes. */
+function withLibraryFaces(canvasId: string, html: string): string {
+  const canvas = store.getCanvas(canvasId)
+  if (!canvas) return html
+  const library = fontsForCanvas(canvas)
+  /* tokens first: a family named only through a font token is then in the
+     document for the font scan to find */
+  const withTokens = withTokenBlock(html, canvas.tokens ?? [], canvas.tokenThemes ?? [])
+  return withWebFontLinks(withFontFaces(withTokens, library), library)
+}
+
 export function appendFrameHtml(
   frameId: string,
   chunk: string,
@@ -1250,8 +1744,13 @@ export function appendFrameHtml(
      sample) and must never be sniffed on its own */
   const escaped = starting ? looksEscapedHtml(chunk) : (streams.get(frameId)?.escaped ?? false)
   const piece = escaped ? decodeEscapedHtml(chunk) : chunk
-  const html = opts.start ? piece : before.html + piece
+  const joined = opts.start ? piece : before.html + piece
+  /* faces join once the document is whole; mid-stream it is still arriving */
+  const html = opts.done ? withLibraryFaces(before.canvasId, joined) : joined
+  const prior = priorState(before)
   const frame = store.updateFrame(frameId, { html }, actor.name)!
+  /* the opening chunk replaces the design; every later one extends this burst */
+  noteHtmlChange(prior, actor, !starting)
 
   if (starting) {
     finishReveal(frameId) /* a live stream overrides any one-shot playback in flight */
@@ -1279,8 +1778,64 @@ export function appendFrameHtml(
 /* ------------------------------------------------------------------ */
 
 export function setCanvasPages(canvasId: string, pages: import('../shared/types.ts').CanvasPageInfo[], actor: Actor) {
-  store.setPages(canvasId, pages)
-  broadcast(canvasId, { type: 'canvas:pages', pages, actor })
+  const saved = store.setPages(canvasId, pages)
+  const next = saved?.pages ?? pages
+  broadcast(canvasId, { type: 'canvas:pages', pages: next, actor })
+  for (const guide of saved?.dropped ?? []) broadcast(canvasId, { type: 'guide', id: guide.id, guide: null, actor })
+  return next
+}
+
+/** Add one page at the end of the canvas, named `name`, with a fresh id; peers
+ *  get the page list. Returns the new page and the whole list. */
+export function createCanvasPage(canvasId: string, name: string, actor: Actor) {
+  const canvas = store.canvases.get(canvasId)
+  if (!canvas) return undefined
+  const pages = canvasPages(canvas)
+  if (pages.length >= MAX_PAGES) throw new PageLimitError()
+  const page = { id: nanoid(10), name }
+  return { page, pages: setCanvasPages(canvasId, [...pages, page], actor) }
+}
+
+/** Point a page's prototype flow at a frame (or clear it); peers get the page list. */
+export function setFlowStart(canvasId: string, pageId: string, frameId: string | null, actor: Actor) {
+  const pages = store.setFlowStart(canvasId, pageId, frameId)
+  if (pages) broadcast(canvasId, { type: 'canvas:pages', pages, actor })
+  return pages
+}
+
+/** Paint a page's canvas a colour of its own (or clear it); peers get the page list. */
+export function setPageBackground(canvasId: string, pageId: string, background: string | null, actor: Actor) {
+  const pages = store.setPageBackground(canvasId, pageId, background)
+  if (pages) broadcast(canvasId, { type: 'canvas:pages', pages, actor })
+  return pages
+}
+
+/** Add or move a ruler guide; peers see it at once. Guides are view
+ *  furniture, not design content, so the canvas stays as recently edited
+ *  as it was and no activity is logged. */
+export function setGuide(canvasId: string, guide: CanvasGuide, actor: Actor) {
+  const saved = store.setGuide(canvasId, guide)
+  if (saved) broadcast(canvasId, { type: 'guide', id: saved.id, guide: saved, actor })
+  return saved
+}
+
+export function deleteGuide(canvasId: string, guideId: string, actor: Actor) {
+  if (store.deleteGuide(canvasId, guideId)) broadcast(canvasId, { type: 'guide', id: guideId, guide: null, actor })
+}
+
+/** Copy a page with its frames; peers get the page list and each new frame. */
+export async function duplicatePage(canvasId: string, pageId: string, actor: Actor) {
+  const copy = await store.duplicatePage(canvasId, pageId, actor.name)
+  if (!copy) return undefined
+  broadcast(canvasId, { type: 'canvas:pages', pages: copy.pages, actor })
+  for (const guide of copy.guides) broadcast(canvasId, { type: 'guide', id: guide.id, guide, actor })
+  for (const frame of copy.frames) {
+    broadcast(canvasId, { type: 'frame:created', frame, actor })
+    emitCanvasEvent(canvasId, { type: 'frame.created', frame, actor })
+  }
+  logActivity(canvasId, actor, `duplicated page “${copy.source.name}” as “${copy.page.name}”`)
+  touch(canvasId, actor)
+  return copy
 }
 
 export function createFrame(
@@ -1294,12 +1849,17 @@ export function createFrame(
     height?: number
     html?: string
     demo?: boolean
+    hidden?: boolean
+    locked?: boolean
+    z?: number
+    rotation?: number
   },
   actor: Actor,
 ): Frame | undefined {
-  if (input.html !== undefined) input = { ...input, html: repairEscapedHtml(input.html) }
+  if (input.html !== undefined) input = { ...input, html: withLibraryFaces(canvasId, repairEscapedHtml(input.html)) }
   const frame = store.createFrame(canvasId, input, actor.name)
   if (!frame) return undefined
+  bursts.set(frame.id, { actor, lastAt: frame.createdAt })
   if (actor.kind === 'agent' && frame.html.length > 0) {
     /* agent one-shot creation still plays back as a reveal */
     broadcast(canvasId, { type: 'frame:created', frame: { ...frame, html: '' }, actor })
@@ -1314,26 +1874,39 @@ export function createFrame(
   return frame
 }
 
+/** `replace` marks a deliberate whole-document write (set_frame_html): it
+ *  always opens a history burst, even when the new document keeps most of
+ *  the old one's wrapper — only the reveal-or-morph choice stays similarity
+ *  based. Without it a write is judged by how much it changed. */
 export function updateFrame(
   frameId: string,
-  patch: Partial<Pick<Frame, 'name' | 'pageId' | 'x' | 'y' | 'width' | 'height' | 'html'>>,
+  patch: Partial<
+    Pick<Frame, 'name' | 'pageId' | 'x' | 'y' | 'width' | 'height' | 'html' | 'hidden' | 'locked' | 'z' | 'rotation'>
+  >,
   actor: Actor,
+  opts: { replace?: boolean } = {},
 ): Frame | undefined {
   const before = store.getFrame(frameId)
   if (!before) return undefined
-  if (patch.html !== undefined) patch = { ...patch, html: repairEscapedHtml(patch.html) }
+  if (patch.html !== undefined)
+    patch = { ...patch, html: withLibraryFaces(before.canvasId, repairEscapedHtml(patch.html)) }
   const prevName = before.name
   const prevHtml = before.html
+  const prevHidden = !!before.hidden
+  const prevLocked = !!before.locked
+  const prior = priorState(before)
   const frame = store.updateFrame(frameId, patch, actor.name)
   if (!frame) return undefined
 
   const htmlChanged = patch.html !== undefined && patch.html !== prevHtml
+  const { prefix, shared } = htmlChanged ? sharedSpan(prevHtml, frame.html) : { prefix: 0, shared: 0 }
+  /* mostly-unchanged replace (small tweak): the client morphs the live DOM
+     in place, so a reveal would only add churn — and the design history
+     files one version per burst of tweaks, not one per keystroke */
+  const smallTweak = htmlChanged && shared >= frame.html.length * 0.5 && shared >= prevHtml.length * 0.5
+  if (htmlChanged) noteHtmlChange(prior, actor, smallTweak && !opts.replace)
   if (htmlChanged && actor.kind === 'agent') {
     finishStream(frameId, false) /* a full replace ends an open append stream */
-    const prefix = commonPrefixLen(prevHtml, frame.html)
-    /* mostly-unchanged replace (small tweak): broadcast at once — the client
-       morphs the live DOM in place, so a reveal would only add churn */
-    const smallTweak = prefix >= frame.html.length * 0.5 && prefix >= prevHtml.length * 0.5
     const openReveal = reveals.get(frameId)
     if (openReveal) {
       /* new content mid-playback: rewind to the divergence and re-arm the deadline */
@@ -1361,11 +1934,72 @@ export function updateFrame(
       logActivity(frame.canvasId, actor, `updated the design of “${frame.name}”`, frame.id)
     } else if (patch.name !== undefined && patch.name !== prevName) {
       logActivity(frame.canvasId, actor, `renamed “${prevName}” to “${frame.name}”`, frame.id)
+    } else if (patch.hidden !== undefined && !!patch.hidden !== prevHidden) {
+      logActivity(frame.canvasId, actor, `${frame.hidden ? 'hid' : 'showed'} frame “${frame.name}”`, frame.id)
     }
+  }
+  /* a lock change is its own line, whatever else the same update carried */
+  if (patch.locked !== undefined && !!patch.locked !== prevLocked) {
+    logActivity(frame.canvasId, actor, `${frame.locked ? 'locked' : 'unlocked'} “${frame.name}”`, frame.id)
   }
 
   touch(frame.canvasId, actor, frame.id)
   return frame
+}
+
+/** Several frames' places in the stack at once (the Layers panel renumbering
+ *  a page, or undoing that): every frame is checked before any is written,
+ *  so the order changes whole or not at all. Undefined when a frame is
+ *  gone or on another canvas. Not a design edit: no activity line. */
+export function restackFrames(canvasId: string, writes: StackWrite[], actor: Actor): Frame[] | undefined {
+  if (writes.some((w) => store.getFrame(w.id)?.canvasId !== canvasId)) return undefined
+  const frames = writes.map((w) => store.updateFrame(w.id, { z: w.z }, actor.name)!)
+  for (const frame of frames) broadcast(canvasId, { type: 'frame:updated', frame, actor })
+  touch(canvasId, actor, frames[0]?.id)
+  return frames
+}
+
+/** Sign-off is a human action, separate from ordinary frame editing. */
+export function setFrameApproval(
+  frameId: string,
+  ready: boolean,
+  user: { id: string; name: string },
+): Frame | undefined {
+  const current = store.getFrame(frameId)
+  if (!current) return undefined
+  if (ready && current.approval?.status === 'ready_for_dev') return current
+  const actor = resolveActor({ name: user.name, kind: 'user' })
+  const approval = ready
+    ? {
+        status: 'ready_for_dev' as const,
+        approvedBy: user.name,
+        approvedByUserId: user.id,
+        approvedAt: Math.max(Date.now(), current.updatedAt + 1),
+        approvedFrameUpdatedAt: current.updatedAt,
+      }
+    : null
+  const frame = store.updateFrame(frameId, { approval }, user.name)!
+  broadcast(frame.canvasId, { type: 'frame:updated', frame, actor })
+  logActivity(
+    frame.canvasId,
+    actor,
+    ready ? `marked “${frame.name}” ready for dev` : `moved “${frame.name}” back to draft`,
+    frameId,
+  )
+  return frame
+}
+
+export function isFrameStreaming(frameId: string): boolean {
+  return streams.has(frameId) || reveals.has(frameId)
+}
+
+/** Whether any frame on the canvas has a stream or playback open, which
+ *  keeps the canvas's frame HTML in memory (store.evictIdle). */
+export function isCanvasStreaming(canvasId: string): boolean {
+  for (const frameId of [...streams.keys(), ...reveals.keys()]) {
+    if (store.getFrame(frameId)?.canvasId === canvasId) return true
+  }
+  return false
 }
 
 export function deleteFrame(frameId: string, actor: Actor): Frame | undefined {
@@ -1375,6 +2009,8 @@ export function deleteFrame(frameId: string, actor: Actor): Frame | undefined {
   finishReveal(frameId)
   const frame = store.deleteFrame(frameId)
   if (!frame) return undefined
+  unsavedStamps.delete(frameId)
+  bursts.delete(frameId)
   thumbs.purge(frameId)
   broadcast(frame.canvasId, { type: 'frame:deleted', frameId, actor })
   logActivity(frame.canvasId, actor, `deleted frame “${frame.name}”`, frame.id)
@@ -1386,12 +2022,14 @@ export function deleteFrame(frameId: string, actor: Actor): Frame | undefined {
 export function deleteCanvas(canvasId: string): boolean {
   const c = store.deleteCanvas(canvasId)
   if (!c) return false
-  for (const f of c.frames) thumbs.purge(f.id)
+  for (const f of c.frames) {
+    thumbs.purge(f.id)
+    bursts.delete(f.id)
+  }
   broadcast(canvasId, { type: 'canvas:deleted' })
   taskLog.delete(canvasId)
   feedbackLog.delete(canvasId)
   commentLog.delete(canvasId)
-  chatLog.delete(canvasId)
   activityLog.delete(canvasId)
   decisionLog.delete(canvasId)
   proposalLog.delete(canvasId)
@@ -1660,6 +2298,431 @@ export function unreadGuidelines(canvasId: string, agent: string, withWorkspace:
 }
 
 /* ------------------------------------------------------------------ */
+/* Design tokens: a canvas's named design values (shared/designTokens) */
+/* — CSS custom properties frames use as var(--name). A change rewrites */
+/* the managed block in every frame that names the token.              */
+/* ------------------------------------------------------------------ */
+
+function tokenError(name: string, message: string): TokenResult {
+  return { name, result: 'error', message }
+}
+
+/** Why a value cannot be written, or null when it can: the literal is one
+ *  clean declaration, an alias names a token that exists (in the canvas or
+ *  earlier in the same batch) and does not loop back. */
+function valueProblem(
+  tokens: readonly DesignToken[],
+  name: string,
+  value: string,
+  themes: Record<string, string> = {},
+): string | null {
+  for (const candidate of [value, ...Object.values(themes)]) {
+    const target = aliasOf(candidate)
+    if (!target) continue
+    if (target === name) return 'a token cannot alias itself'
+    if (!tokens.some((t) => t.name === target)) return `aliases ${target}, which does not exist — create it first`
+  }
+  const probe: DesignToken[] = [
+    ...tokens.filter((t) => t.name !== name),
+    { name, type: 'color', value, themes, order: 0, updatedAt: 0, updatedBy: '' },
+  ]
+  /* a chain is followed per theme, each token under its value there */
+  const every = new Set<string | undefined>([undefined])
+  for (const token of probe) for (const theme of Object.keys(token.themes ?? {})) every.add(theme)
+  for (const theme of every) {
+    if (resolveToken(probe, name, theme) === null)
+      return theme ? `aliasing would loop in ${theme}` : 'aliasing would loop'
+  }
+  return null
+}
+
+/** The theme values of an input, normalized: null when one is unusable or
+ *  the theme name is not one, undefined when none were given. A null entry
+ *  (an edit) removes that theme's value. */
+function cleanThemes(
+  value: unknown,
+): { themes: Record<string, string>; removed: string[] } | undefined | { error: string } {
+  if (value === undefined) return undefined
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { error: 'themes must be an object' }
+  const themes: Record<string, string> = {}
+  const removed: string[] = []
+  for (const [theme, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!isThemeName(theme)) return { error: `invalid theme name “${theme}” — use a lowercase slug like "dark"` }
+    if (raw === null) {
+      removed.push(theme)
+      continue
+    }
+    const text = normalizeTokenValue(raw)
+    if (text === null) return { error: `invalid value for theme ${theme} — one CSS value, no semicolons or braces` }
+    themes[theme] = text
+  }
+  return { themes, removed }
+}
+
+/** Declare any theme a token names that the canvas does not have yet. */
+function declareThemes(canvasId: string, themes: Record<string, string>, by: string): string | null {
+  const known = store.getTokenThemes(canvasId)
+  const fresh = Object.keys(themes).filter((theme) => !known.includes(theme))
+  if (!fresh.length) return null
+  if (known.length + fresh.length > MAX_TOKEN_THEMES) return `a canvas has at most ${MAX_TOKEN_THEMES} token themes`
+  store.setTokenThemes(canvasId, [...known, ...fresh], by)
+  return null
+}
+
+function cleanDescription(value: unknown): string | undefined | null {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string') return null
+  const text = value.replace(/\s+/g, ' ').trim()
+  return text.length > MAX_TOKEN_DESCRIPTION ? null : text
+}
+
+/** Names of the tokens a frame uses, directly: what a token edit must restyle. */
+export function tokenUsage(canvasId: string): Map<string, number> {
+  const counts = new Map<string, number>()
+  const canvas = store.getCanvas(canvasId)
+  if (!canvas) return counts
+  for (const token of canvas.tokens ?? []) {
+    counts.set(token.name, canvas.frames.filter((f) => usesToken(f.html, token.name)).length)
+  }
+  return counts
+}
+
+/** Rewrite every frame whose managed token block no longer matches the
+ *  canvas's tokens (and, on a rename, the references to the old name). An
+ *  annotation write: nothing a reviewer signed off on moved, so sign-off
+ *  stands and no version is filed. Returns how many frames changed. */
+type TokenRename = { kind: 'token' | 'theme'; from: string; to: string }
+
+/** Renames a frame with an open append stream still has to take: applied
+ *  when the stream closes, done chunk or idle. */
+const pendingRenames = new Map<string, TokenRename[]>()
+
+function applyRename(html: string, rename: TokenRename): string {
+  return rename.kind === 'token'
+    ? renameTokenRefs(html, rename.from, rename.to)
+    : renameThemeAttrs(html, rename.from, rename.to)
+}
+
+function restyleTokenFrames(canvasId: string, actor: Actor, rename?: TokenRename): number {
+  const canvas = store.getCanvas(canvasId)
+  if (!canvas) return 0
+  let changed = 0
+  for (const frame of [...canvas.frames]) {
+    /* an open append stream gets its block, and any rename, with its done chunk */
+    if (streams.has(frame.id)) {
+      if (rename) pendingRenames.set(frame.id, [...(pendingRenames.get(frame.id) ?? []), rename])
+      continue
+    }
+    let html = frame.html
+    if (rename) html = applyRename(html, rename)
+    html = withLibraryFaces(canvasId, html)
+    if (html === frame.html) continue
+    const prevHtml = frame.html
+    const updated = store.updateFrame(frame.id, { html }, actor.name, { annotation: true })
+    if (!updated) continue
+    thumbs.purge(frame.id)
+    const openReveal = reveals.get(frame.id)
+    if (openReveal) {
+      /* mid-playback: rewind to where the documents diverge, as a rewrite does */
+      openReveal.shown = Math.min(openReveal.shown, sharedSpan(prevHtml, updated.html).prefix)
+      openReveal.deadline = Date.now() + revealDuration(updated.html.length - openReveal.shown)
+    } else broadcast(canvasId, { type: 'frame:updated', frame: updated, actor })
+    changed++
+  }
+  return changed
+}
+
+function renameTokenRefs(html: string, from: string, to: string): string {
+  const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return html.replace(new RegExp(`var\\(\\s*${escaped}(?=\\s*[,)])`, 'g'), `var(${to}`)
+}
+
+function tokenSummary(results: TokenResult[], verb: string): string {
+  const names = results.filter((r) => r.result !== 'error').map((r) => r.name)
+  if (!names.length) return ''
+  return names.length <= 3
+    ? `${verb} the design token${names.length > 1 ? 's' : ''} ${names.join(', ')}`
+    : `${verb} ${names.length} design tokens`
+}
+
+/** Add tokens; one result per entry, errors in-band so a batch with one bad
+ *  entry still lands the rest. Returns undefined when the canvas is missing. */
+export function createTokens(canvasId: string, inputs: unknown[], actor: Actor): TokenResult[] | undefined {
+  const canvas = store.getCanvas(canvasId)
+  if (!canvas) return undefined
+  const results: TokenResult[] = []
+  const accepted: {
+    name: string
+    type: TokenType
+    value: string
+    themes?: Record<string, string>
+    description?: string
+  }[] = []
+  const pending: DesignToken[] = [...(canvas.tokens ?? [])]
+  for (const raw of inputs) {
+    const input = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
+    const name = normalizeTokenName(input.name)
+    if (!isTokenName(name)) {
+      results.push(tokenError(name || '?', `invalid name “${name}” — letters, digits, hyphens and underscores only`))
+      continue
+    }
+    if (!isTokenType(input.type)) {
+      results.push(tokenError(name, `unknown token type “${String(input.type)}”`))
+      continue
+    }
+    const value = normalizeTokenValue(input.value)
+    if (value === null) {
+      results.push(tokenError(name, 'invalid value — one CSS value, no semicolons or braces'))
+      continue
+    }
+    const description = cleanDescription(input.description)
+    if (description === null) {
+      results.push(tokenError(name, `description must be text under ${MAX_TOKEN_DESCRIPTION} characters`))
+      continue
+    }
+    if (pending.some((t) => t.name === name)) {
+      results.push(tokenError(name, 'a token with this name already exists — change it with set_tokens'))
+      continue
+    }
+    if (pending.length >= MAX_TOKENS) {
+      results.push(tokenError(name, `this canvas already has ${MAX_TOKENS} tokens`))
+      continue
+    }
+    const cleaned = cleanThemes(input.themes)
+    if (cleaned && 'error' in cleaned) {
+      results.push(tokenError(name, cleaned.error))
+      continue
+    }
+    const themes = cleaned?.themes ?? {}
+    const problem = valueProblem(pending, name, value, themes)
+    if (problem) {
+      results.push(tokenError(name, problem))
+      continue
+    }
+    const declared = declareThemes(canvasId, themes, actor.name)
+    if (declared) {
+      results.push(tokenError(name, declared))
+      continue
+    }
+    const token: DesignToken = { name, type: input.type, value, order: pending.length + 1, updatedAt: 0, updatedBy: '' }
+    pending.push(token)
+    accepted.push({
+      name,
+      type: input.type,
+      value,
+      ...(Object.keys(themes).length ? { themes } : {}),
+      ...(description ? { description } : {}),
+    })
+    results.push({ name, result: 'created' })
+  }
+  if (accepted.length) {
+    store.setTokens(canvasId, accepted, actor.name)
+    /* frames that already name the token (a recreate, an agent that wrote
+       var() first) start resolving it now */
+    const restyled = restyleTokenFrames(canvasId, actor)
+    broadcast(canvasId, {
+      type: 'tokens',
+      tokens: store.getTokens(canvasId),
+      themes: store.getTokenThemes(canvasId),
+      actor,
+    })
+    const summary = tokenSummary(results, 'added')
+    logActivity(
+      canvasId,
+      actor,
+      restyled ? `${summary} (${restyled} frame${restyled === 1 ? '' : 's'} restyled)` : summary,
+    )
+    touch(canvasId, actor)
+  }
+  return results
+}
+
+/** Change, rename or delete tokens by name, in order; one result per entry.
+ *  Every frame naming a changed token is restyled before this returns. */
+export function setTokens(canvasId: string, edits: TokenEdit[], actor: Actor): TokenResult[] | undefined {
+  if (!store.getCanvas(canvasId)) return undefined
+  const results: TokenResult[] = []
+  const renames: TokenRename[] = []
+  let touched = 0
+  for (const edit of edits) {
+    const tokens = store.getTokens(canvasId)
+    const name = normalizeTokenName(edit.name)
+    const token = tokens.find((t) => t.name === name)
+    if (!token) {
+      results.push(tokenError(name || '?', `no token named “${name}”`))
+      continue
+    }
+    if (edit.delete) {
+      const dependant = tokens.find(
+        (t) => aliasOf(t.value) === name || Object.values(t.themes ?? {}).some((v) => aliasOf(v) === name),
+      )
+      if (dependant) {
+        results.push(tokenError(name, `${dependant.name} aliases it — change that token first`))
+        continue
+      }
+      store.deleteToken(canvasId, name)
+      results.push({ name, result: 'deleted' })
+      touched++
+      continue
+    }
+    const type = edit.type === undefined ? token.type : edit.type
+    if (!isTokenType(type)) {
+      results.push(tokenError(name, `unknown token type “${String(edit.type)}”`))
+      continue
+    }
+    const value = edit.value === undefined ? token.value : normalizeTokenValue(edit.value)
+    if (value === null) {
+      results.push(tokenError(name, 'invalid value — one CSS value, no semicolons or braces'))
+      continue
+    }
+    const description = cleanDescription(edit.description)
+    if (description === null) {
+      results.push(tokenError(name, `description must be text under ${MAX_TOKEN_DESCRIPTION} characters`))
+      continue
+    }
+    const cleaned = cleanThemes(edit.themes)
+    if (cleaned && 'error' in cleaned) {
+      results.push(tokenError(name, cleaned.error))
+      continue
+    }
+    const themes = { ...(token.themes ?? {}), ...(cleaned?.themes ?? {}) }
+    for (const theme of cleaned?.removed ?? []) delete themes[theme]
+    const problem = valueProblem(tokens, name, value, themes)
+    if (problem) {
+      results.push(tokenError(name, problem))
+      continue
+    }
+    /* every check before any write: a refused edit changes nothing */
+    let newName = name
+    if (edit.newName !== undefined && normalizeTokenName(edit.newName) !== name) {
+      newName = normalizeTokenName(edit.newName)
+      if (!isTokenName(newName)) {
+        results.push(tokenError(name, `invalid name “${newName}” — letters, digits, hyphens and underscores only`))
+        continue
+      }
+      if (tokens.some((t) => t.name === newName)) {
+        results.push(tokenError(name, `a token named ${newName} already exists`))
+        continue
+      }
+    }
+    const declared = declareThemes(canvasId, themes, actor.name)
+    if (declared) {
+      results.push(tokenError(name, declared))
+      continue
+    }
+    if (newName !== name) {
+      store.renameToken(canvasId, name, newName, actor.name)
+      /* every var() reference to the old name in another token's values
+         follows it, whole-value aliases and references inside expressions alike */
+      const referencing = store
+        .getTokens(canvasId)
+        .filter((t) => [t.value, ...Object.values(t.themes ?? {})].some((v) => usesToken(v, name)))
+        .map((t) => ({
+          name: t.name,
+          type: t.type,
+          value: renameTokenRefs(t.value, name, newName),
+          themes: Object.fromEntries(
+            Object.entries(t.themes ?? {}).map(([theme, v]) => [theme, renameTokenRefs(v, name, newName)]),
+          ),
+          description: t.description,
+        }))
+      if (referencing.length) store.setTokens(canvasId, referencing, actor.name)
+      renames.push({ kind: 'token', from: name, to: newName })
+    }
+    store.setTokens(
+      canvasId,
+      [
+        {
+          name: newName,
+          type,
+          value,
+          themes,
+          description: description === undefined ? token.description : description,
+          ...(typeof edit.order === 'number' && Number.isFinite(edit.order) ? { order: edit.order } : {}),
+        },
+      ],
+      actor.name,
+    )
+    results.push({ name: newName, result: 'updated' })
+    touched++
+  }
+  if (touched) {
+    let restyled = 0
+    for (const rename of renames) restyled += restyleTokenFrames(canvasId, actor, rename)
+    restyled += restyleTokenFrames(canvasId, actor)
+    broadcast(canvasId, {
+      type: 'tokens',
+      tokens: store.getTokens(canvasId),
+      themes: store.getTokenThemes(canvasId),
+      actor,
+    })
+    const summary = tokenSummary(results, 'changed')
+    logActivity(
+      canvasId,
+      actor,
+      restyled ? `${summary} (${restyled} frame${restyled === 1 ? '' : 's'} restyled)` : summary,
+    )
+    touch(canvasId, actor)
+  }
+  return results
+}
+
+/** Replace the canvas's token themes (order included): a theme that leaves
+ *  takes its values with it, and every frame is restyled. Throws on bad
+ *  input with a message for the caller's error channel. */
+export function setTokenThemes(
+  canvasId: string,
+  themes: unknown,
+  actor: Actor,
+  renames: unknown = [],
+): string[] | undefined {
+  if (!store.getCanvas(canvasId)) return undefined
+  if (!Array.isArray(themes)) throw new Error('themes must be an array of names')
+  if (!Array.isArray(renames)) throw new Error('renames must be an array of { from, to }')
+  /* every check runs against a simulated list before anything is written,
+     so a bad request changes nothing */
+  const before = store.getTokenThemes(canvasId)
+  let simulated = [...before]
+  const moves: { from: string; to: string }[] = []
+  for (const raw of renames) {
+    const entry = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
+    const from = typeof entry.from === 'string' ? entry.from.trim().toLowerCase() : ''
+    const to = typeof entry.to === 'string' ? entry.to.trim().toLowerCase() : ''
+    if (!isThemeName(to)) throw new Error(`invalid theme name “${String(entry.to)}” — use a lowercase slug like "dark"`)
+    if (from === to) continue
+    if (!simulated.includes(from)) throw new Error(`no theme named “${from}”`)
+    if (simulated.includes(to)) throw new Error(`a theme named “${to}” already exists`)
+    simulated = simulated.map((theme) => (theme === from ? to : theme))
+    moves.push({ from, to })
+  }
+  const names: string[] = []
+  for (const raw of themes) {
+    const theme = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
+    if (!isThemeName(theme)) throw new Error(`invalid theme name “${String(raw)}” — use a lowercase slug like "dark"`)
+    if (!names.includes(theme)) names.push(theme)
+  }
+  if (names.length > MAX_TOKEN_THEMES) throw new Error(`a canvas has at most ${MAX_TOKEN_THEMES} token themes`)
+  const same = simulated.length === names.length && simulated.every((theme, i) => theme === names[i])
+  if (same && !moves.length) return names
+
+  let restyled = 0
+  for (const move of moves) {
+    store.renameTokenTheme(canvasId, move.from, move.to, actor.name)
+    restyled += restyleTokenFrames(canvasId, actor, { kind: 'theme', ...move })
+  }
+  if (!same) store.setTokenThemes(canvasId, names, actor.name)
+  restyled += restyleTokenFrames(canvasId, actor)
+  broadcast(canvasId, { type: 'tokens', tokens: store.getTokens(canvasId), themes: names, actor })
+  logActivity(
+    canvasId,
+    actor,
+    `set the token themes to ${names.length ? names.join(', ') : 'none'}${restyled ? ` (${restyled} frame${restyled === 1 ? '' : 's'} restyled)` : ''}`,
+  )
+  touch(canvasId, actor)
+  return names
+}
+
+/* ------------------------------------------------------------------ */
 /* Design memory: pinned reference frames (exemplars), captured        */
 /* decisions (addressed feedback), and distiller proposals (rule edits */
 /* a human accepts into a guide or dismisses). The guides above are    */
@@ -1717,8 +2780,6 @@ export function setDecisionSummary(canvasId: string, id: string, summary: string
   broadcast(canvasId, { type: 'decision', decision })
 }
 
-export const MAX_DECISION_CHARS = 500
-
 /** A connected agent reports a design decision its human made in conversation
  *  (the save_decision MCP tool) — the only party that hears that channel is
  *  the agent, so it is the reporter. Throws on bad input; returns undefined
@@ -1729,7 +2790,7 @@ export function recordChatDecision(canvasId: string, text: string, actor: Actor)
   if (!clean) throw new Error('decision text is empty')
   if (clean.length > MAX_DECISION_CHARS)
     throw new Error(
-      `decision is ${clean.length} chars — keep it under ${MAX_DECISION_CHARS} (the human's words, not an essay)`,
+      `decision is ${clean.length} chars — save one decision and its rationale per call, at most ${MAX_DECISION_CHARS} characters; split longer feedback into separate calls by topic`,
     )
   /* agents re-tell things; the same words land in Memory once */
   if (getDecisions(canvasId).some((d) => d.text === clean)) return null

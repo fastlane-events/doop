@@ -102,3 +102,14 @@ install").
 - Moving a canvas between workspaces does not push the new inherited set to open viewers; they
   see it on reload.
 - The distiller proposes into canvas docs only (avoiding the organisation rules' names).
+
+## Migration and upstream syncs
+
+The tables first shipped as migration `0029_scoped_guidelines`, which upstream later also
+numbered `0029..0050`. drizzle applies only migrations newer than the last journal row, so on the
+2026-11-10 sync the migration was renumbered `0051_scoped_guidelines` and made idempotent, and
+`server/db/index.ts` (`rewindForkMigration`) moves the old row back to 0028's time so upstream's
+migrations run on databases that had ours. Checked against a restore of the production database.
+On each future sync: our migration must stay the newest one. Regenerate it after upstream's
+(`bunx drizzle-kit generate --name scoped_guidelines`, then make it idempotent) whenever upstream
+adds migrations, and never give a fork migration a number upstream may also use.

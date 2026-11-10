@@ -15,9 +15,16 @@
   (`.oxlintrc.json`, generated from the old ESLint config with `@oxlint/migrate`) carries the whole
   rule set: ESLint recommended, typescript recommended, the React Compiler / hooks rules for
   `src/`, and the type-aware rules through tsgolint. ESLint (`eslint.config.js`) remains for what
-  oxlint cannot cover: the `no-restricted-syntax` selector that bans `process.env` outside
-  `server/env.ts`, and `no-undef` for the plain JavaScript in `scripts/`, `ios/scripts/` and
-  `public/` that no type check sees; it loads no type information.
+  oxlint cannot cover: the `no-restricted-syntax` selectors that ban `process.env` outside
+  `server/env.ts` and, in `src/pages/**`, `src/components/**` and `src/integrations/**`, raw
+  `<button>` / `<input>` / `<select>` / `<textarea>`, `role="button"` / `role="link"` on a plain
+  element, arbitrary `text-[…]` / `rounded-[…]`, Tailwind's stock `text-xs`…`text-9xl` and
+  `rounded` / `rounded-sm`…`rounded-3xl`, `leading-[…]` / `tracking-[…]`, `font-bold` /
+  `font-extrabold` / `font-black` / `font-[…]`, and hex colours in `bg-[#…]` / `text-[#…]` /
+  `border-[#…]` (compose `src/components/ui`, the named scale and the colour tokens instead;
+  `src/components/ui/**` and the `LEGACY_CHROME` list of unmigrated editor files are exempt), and
+  `no-undef` for the plain JavaScript in `scripts/`, `ios/scripts/` and `public/` that no type
+  check sees; it loads no type information.
 - `react/set-state-in-effect` and `react/exhaustive-deps` are at `error` for `src/`. Reset state
   from a changed prop during render (the `seen`/`setSeen` pattern), not in an effect; a genuine
   external-system sync may carry a scoped `eslint-disable-next-line` with a reason (oxlint honours

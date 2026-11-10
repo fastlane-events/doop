@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { mergeGuidelines } from '../../shared/types'
 import type { InheritedScope, MemoryReference } from '../../shared/types'
-import { useStore } from '../lib/store'
+import { canEditOpenCanvas, useStore } from '../lib/store'
 import { api } from '../lib/api'
 import { timeAgo } from '../lib/time'
 import { Button } from './ui/button'
@@ -11,6 +11,7 @@ import { ListHint, ListItem, ListMeta, ListRow, ListSection, ListTitle } from '.
 import { Modal, ModalActions, ModalLede, ModalSpacer, ModalTitle } from './ui/modal'
 import { DoopMark } from './Logo'
 import { GuideModal, GuideRow, guideTitle, type GuideSource } from './GuideModal'
+import { getLocale, useT } from '@/lib/i18n'
 
 /* Timestamp/author line under a modal heading. */
 const meta = 'mt-1.5 text-[11.5px] text-ink-faint'
@@ -28,11 +29,14 @@ export function MemoryPanel() {
   const references = useStore((s) => s.canvas?.references ?? [])
   const decisions = useStore((s) => s.decisions)
   const proposals = useStore((s) => s.proposals)
+  /* view and comment links read Memory; they do not curate it */
+  const readOnly = useStore((s) => !canEditOpenCanvas(s))
   /** slug of the open guide, '' = create a new one, null = closed */
   const [openGuide, setOpenGuide] = useState<string | null>(null)
   const [openRef, setOpenRef] = useState<string | null>(null)
   /** name of the open inherited (read-only) guide */
   const [openInherited, setOpenInherited] = useState<string | null>(null)
+  const t = useT()
 
   /* the workspace and instance docs this canvas follows: merged the way the
      server merges them — a style doc a canvas doc of the same name
@@ -45,25 +49,26 @@ export function MemoryPanel() {
       layers.filter((d) => d.scope === 'workspace'),
     ]).filter((d) => d.kind === 'instructions' || !own.has(d.name))
   }, [docs, inheritedDocs])
+  /* a view or comment link reads the guides but gets no save or history */
   const source = useMemo<GuideSource | null>(
     () =>
-      canvasId
+      canvasId && !readOnly
         ? {
             history: (name) => api.guidelineHistory(canvasId, name),
             save: (name, markdown, title, kind) => api.setGuideline(canvasId, name, markdown, title, kind),
           }
         : null,
-    [canvasId],
+    [canvasId, readOnly],
   )
 
-  if (!canvasId || !source) return null
+  if (!canvasId) return null
 
   const ownDocs = docs ?? []
   /* an organisation rule hides a canvas doc that shares its name (one that
      predates the rule — new ones are refused); it can still be deleted */
   const ruleNames = new Set(inherited.filter((d) => d.kind === 'instructions').map((d) => d.name))
   const inheritedOpen = inherited.find((d) => d.name === openInherited)
-  const pending = proposals.filter((p) => p.status === 'pending')
+  const pending = readOnly ? [] : proposals.filter((p) => p.status === 'pending')
   const empty =
     ownDocs.length === 0 &&
     inherited.length === 0 &&
@@ -75,20 +80,16 @@ export function MemoryPanel() {
     <PanelBody className="flex flex-col py-2">
       {empty && (
         <div className="border-b border-line-soft px-4 py-3.5">
-          <p className="text-[12.5px] leading-[1.5] font-semibold text-ink">
-            Memory is how this canvas remembers your taste — and how every agent designs with it.
-          </p>
+          <p className="text-[12.5px] leading-[1.5] font-semibold text-ink">{t('panels.memoryIntro')}</p>
           <ul className="mt-2.5 flex flex-col gap-2 pl-4">
             <li className="text-[12px] leading-[1.5] text-ink-soft">
-              <b>References</b> — pin a frame you love (the 🧠 on its corner). Agents copy its colors, type and layout
-              when they design something new.
+              <b>{t('panels.memoryReferences')}</b> {t('panels.memoryIntroReferences')}
             </li>
             <li className="text-[12px] leading-[1.5] text-ink-soft">
-              <b>Rules</b> — style guides agents read before designing. Write them, or let them grow.
+              <b>{t('panels.memoryRules')}</b> {t('panels.memoryIntroRules')}
             </li>
             <li className="text-[12px] leading-[1.5] text-ink-soft">
-              <b>Decisions</b> — feedback you give agents is captured here automatically once it’s addressed. When a
-              preference keeps recurring, Doop suggests adding it to your rules.
+              <b>{t('panels.memoryDecisions')}</b> {t('panels.memoryIntroDecisions')}
             </li>
           </ul>
         </div>
@@ -97,11 +98,11 @@ export function MemoryPanel() {
       {pending.map((p) => (
         <div key={p.id} className="mx-4 mt-3 rounded-[12px] border border-brand bg-surface px-3.5 py-3 shadow-card">
           <div className="text-[10.5px] font-extrabold uppercase tracking-[0.08em] text-accent-ink">
-            <DoopMark size={11} /> Memory suggestion
+            <DoopMark size={11} /> {t('panels.memorySuggestion')}
           </div>
           <div className="mt-1.5 text-[13px] font-semibold leading-[1.45] text-ink">{p.rule.replace(/^-\s*/, '')}</div>
           <div className="mt-1.5 text-[11.5px] leading-[1.45] text-ink-faint">
-            {p.rationale} · from {p.basedOn.length} decision{p.basedOn.length === 1 ? '' : 's'} → “
+            {p.rationale} · {t('panels.memoryFromDecisions', { count: p.basedOn.length })} → “
             {p.guideTitle ?? guideTitle({ name: p.guideName })}”
           </div>
           <div className="mt-2.5 flex justify-end gap-2">
@@ -111,7 +112,7 @@ export function MemoryPanel() {
               className="text-[11.5px]"
               onClick={() => api.resolveProposal(canvasId, p.id, false).catch(console.error)}
             >
-              Dismiss
+              {t('panels.memoryDismiss')}
             </Button>
             <Button
               variant="primary"
@@ -119,20 +120,17 @@ export function MemoryPanel() {
               className="text-[11.5px]"
               onClick={() => api.resolveProposal(canvasId, p.id, true).catch(console.error)}
             >
-              Add to rules
+              {t('panels.memoryAddToRules')}
             </Button>
           </div>
         </div>
       ))}
 
       <ListSection>
-        <span>References</span>
+        <span>{t('panels.memoryReferences')}</span>
       </ListSection>
       {references.length === 0 ? (
-        <ListHint>
-          No references yet. Pin a frame you like (the 🧠 on its corner) and agents will copy its colors, type and
-          layout in new designs.
-        </ListHint>
+        <ListHint>{t('panels.memoryNoReferences')}</ListHint>
       ) : (
         references.map((r) => (
           <ListRow key={r.id} className="gap-1 py-2.5" onClick={() => setOpenRef(r.id)}>
@@ -146,19 +144,19 @@ export function MemoryPanel() {
       )}
 
       <ListSection>
-        <span>Rules</span>
-        <Button
-          variant="solid"
-          size="sm"
-          className="flex-none text-[11.5px] font-bold"
-          onClick={() => setOpenGuide('')}
-        >
-          + New
-        </Button>
+        <span>{t('panels.memoryRules')}</span>
+        {!readOnly && (
+          <Button
+            variant="solid"
+            size="sm"
+            className="flex-none text-[11.5px] font-bold"
+            onClick={() => setOpenGuide('')}
+          >
+            {t('panels.memoryNew')}
+          </Button>
+        )}
       </ListSection>
-      {ownDocs.length === 0 && inherited.length === 0 && (
-        <ListHint>Style guides every agent reads before designing here.</ListHint>
-      )}
+      {ownDocs.length === 0 && inherited.length === 0 && <ListHint>{t('panels.memoryRulesHint')}</ListHint>}
       {ownDocs.map((d) => (
         <GuideRow
           key={d.name}
@@ -179,7 +177,7 @@ export function MemoryPanel() {
       {decisions.length > 0 && (
         <>
           <ListSection>
-            <span>Decisions</span>
+            <span>{t('panels.memoryDecisions')}</span>
           </ListSection>
           {decisions.slice(0, 20).map((d) => (
             <ListItem key={d.id} title={d.summary ? `${d.from}: “${d.text}”` : undefined}>
@@ -187,7 +185,7 @@ export function MemoryPanel() {
               <ListMeta>
                 {d.from}
                 {d.agentName ? ` → ${d.agentName}` : ''} · {timeAgo(d.at)}
-                {d.distilledAt ? ' · distilled' : ''}
+                {d.distilledAt ? ` · ${t('panels.memoryDistilled')}` : ''}
               </ListMeta>
             </ListItem>
           ))}
@@ -253,14 +251,16 @@ function RefModal({
   reference: MemoryReference | null
   onClose: () => void
 }) {
+  const readOnly = useStore((s) => !canEditOpenCanvas(s))
+  const t = useT()
   if (!reference) {
     return (
       <Modal size="xl" onClose={onClose}>
-        <ModalTitle className="sr-only">Reference</ModalTitle>
-        <ModalLede>This reference is no longer pinned.</ModalLede>
+        <ModalTitle className="sr-only">{t('panels.memoryReference')}</ModalTitle>
+        <ModalLede>{t('panels.memoryReferenceGone')}</ModalLede>
         <ModalActions>
           <Button variant="ghost" onClick={onClose}>
-            Close
+            {t('common.close')}
           </Button>
         </ModalActions>
       </Modal>
@@ -278,8 +278,10 @@ function RefModal({
           </Badge>
         </div>
         <div className={meta}>
-          pinned by {reference.pinnedBy} · {new Date(reference.pinnedAt).toLocaleString()} — agents copy this design’s
-          colors, type and layout in new work
+          {t('panels.memoryPinnedBy', {
+            name: reference.pinnedBy,
+            date: new Date(reference.pinnedAt).toLocaleString(getLocale()),
+          })}
         </div>
         <div
           className="mt-3.5 overflow-auto rounded-[12px] border border-line bg-surface"
@@ -295,18 +297,20 @@ function RefModal({
           />
         </div>
         <ModalActions>
-          <Button
-            variant="ghost"
-            onClick={() => {
-              api.unpinReference(canvasId, reference.id).catch(console.error)
-              onClose()
-            }}
-          >
-            Unpin
-          </Button>
+          {!readOnly && (
+            <Button
+              variant="ghost"
+              onClick={() => {
+                api.unpinReference(canvasId, reference.id).catch(console.error)
+                onClose()
+              }}
+            >
+              {t('panels.memoryUnpin')}
+            </Button>
+          )}
           <ModalSpacer />
           <Button variant="ghost" onClick={onClose}>
-            Close
+            {t('common.close')}
           </Button>
         </ModalActions>
       </>

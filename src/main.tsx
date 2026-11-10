@@ -5,17 +5,25 @@ import { App } from './App'
 import { SourceLink } from './components/SourceLink'
 import { initDesktopShell } from './lib/desktop'
 import { TooltipProvider } from './components/ui/tooltip'
+import { UpdateCard } from './components/UpdateCard'
 import { initTheme } from './lib/theme'
+import { initLocale } from './lib/i18n'
+import { installTranslateGuard } from './lib/translateGuard'
 import './styles.css'
 
+installTranslateGuard()
 initDesktopShell()
 initTheme()
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <TooltipProvider>
-      <App />
-      <SourceLink />
-    </TooltipProvider>
-  </React.StrictMode>,
+/* the language is settled first, so the first paint already speaks it */
+void initLocale().then(() =>
+  ReactDOM.createRoot(document.getElementById('root')!).render(
+    <React.StrictMode>
+      <TooltipProvider>
+        <App />
+        <UpdateCard />
+        <SourceLink />
+      </TooltipProvider>
+    </React.StrictMode>,
+  ),
 )

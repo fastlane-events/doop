@@ -3,7 +3,7 @@ import type { GuidelineDoc, GuidelineKind } from '../../shared/types'
 import type { GuidelineSaveResult, GuidelineVersion } from '../lib/api'
 import { Callout } from './ui/callout'
 import { timeAgo } from '../lib/time'
-import { Sel } from './AutomateShell'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { Input } from './ui/input'
@@ -16,8 +16,8 @@ const MAX_GUIDELINE_CHARS = 24_000
 const MAX_TITLE_CHARS = 80
 
 /* Timestamp/author line under a modal heading. */
-const meta = 'mt-1.5 text-[11.5px] text-ink-faint'
-const errorText = 'mt-2.5 text-[13px] text-accent-ink'
+const meta = 'mt-1.5 text-caption text-ink-faint'
+const errorText = 'mt-2.5 text-copy text-accent-ink'
 const modalHead = 'flex flex-wrap items-baseline gap-2.5'
 
 const KIND_LABELS: Record<GuidelineKind, string> = { style: 'Style guide', instructions: 'Agent instructions' }
@@ -101,7 +101,7 @@ export function GuideModal({
             <ModalTitle className="sr-only">{creating ? 'New rule' : 'Edit rule'}</ModalTitle>
             <Input
               inputSize="lg"
-              className="rounded-[10px] bg-paper font-display font-extrabold focus:ring-0 md:text-[19px]"
+              className="rounded-pill bg-paper font-display text-heading font-semibold focus:ring-0"
               autoFocus={creating}
               placeholder="Name, e.g. “Featured Images”"
               value={titleDraft}
@@ -112,19 +112,18 @@ export function GuideModal({
             <div className="flex flex-wrap items-center gap-2.5">
               <div className={meta}>id: {creating ? slugify(titleDraft) || '…' : doc?.name}</div>
               <ModalSpacer />
-              <Sel
-                className="mt-1.5"
-                value={kindDraft}
-                disabled={busy}
-                onChange={(e) => setKindDraft(e.target.value as GuidelineKind)}
-                aria-label="Kind"
-              >
-                <option value="style">{KIND_LABELS.style} — how frames look</option>
-                <option value="instructions">{KIND_LABELS.instructions} — how agents work</option>
-              </Sel>
+              <Select value={kindDraft} disabled={busy} onValueChange={(v) => setKindDraft(v as GuidelineKind)}>
+                <SelectTrigger size="sm" className="mt-1.5" aria-label="Kind">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="style">{KIND_LABELS.style} — how frames look</SelectItem>
+                  <SelectItem value="instructions">{KIND_LABELS.instructions} — how agents work</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <Textarea
-              className="mt-3 min-h-[38dvh] resize-y rounded-[12px] bg-surface px-4 py-3.5 font-mono leading-[1.65] focus:ring-0 sm:min-h-[46vh] md:text-[12.5px]"
+              className="mt-3 min-h-[38dvh] resize-y rounded-card bg-surface px-4 py-3.5 font-mono text-body/5 focus:ring-0 sm:min-h-[46vh]"
               autoFocus={!creating}
               placeholder={'# Rules\n\nPalette, fonts, layout recipes, asset URLs…'}
               value={draft}
@@ -306,7 +305,7 @@ function GuideHistory({
         </>
       ) : (
         <>
-          <div className="mt-3.5 overflow-hidden rounded-[12px] border border-line bg-surface">
+          <div className="mt-3.5 overflow-hidden rounded-card border border-line bg-surface">
             {versions?.length === 0 && <ModalLede>No versions recorded yet.</ModalLede>}
             {(versions ?? []).map((v, i) => (
               <ListRow
@@ -358,16 +357,16 @@ export function GuideRow({
       <ListTitle>
         {guideTitle(doc)}
         {badge && (
-          <Badge tone="accent" className="ml-1.5 rounded-full px-1.5 py-0 text-[10px]">
+          <Badge tone="accent" className="ml-1.5 rounded-full px-1.5 py-0 text-micro">
             {badge}
           </Badge>
         )}
         {doc.kind === 'instructions' && (
-          <Badge className="ml-1.5 rounded-full px-1.5 py-0 text-[10px]">{KIND_LABELS.instructions}</Badge>
+          <Badge className="ml-1.5 rounded-full px-1.5 py-0 text-micro">{KIND_LABELS.instructions}</Badge>
         )}
       </ListTitle>
       <ListSummary>{summarize(doc.markdown)}</ListSummary>
-      {warning && <span className="text-[11.5px] leading-[1.4] text-accent-ink">{warning}</span>}
+      {warning && <span className="text-caption text-accent-ink">{warning}</span>}
       <ListMeta>
         {doc.updatedBy} · {timeAgo(doc.updatedAt)}
       </ListMeta>
@@ -394,7 +393,7 @@ export function GuideList({
       <ListSection>
         <span>Rules</span>
         {source && (
-          <Button variant="solid" size="sm" className="flex-none text-[11.5px] font-bold" onClick={() => setOpen('')}>
+          <Button variant="solid" size="sm" className="flex-none" onClick={() => setOpen('')}>
             + New
           </Button>
         )}

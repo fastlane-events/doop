@@ -34,12 +34,13 @@ it('upgrades an existing OSS database without the deferred Figma migration', asy
     )
     expect(tables.rows.map((row) => row.table_name)).toEqual(
       expect.arrayContaining([
-        'chat_messages',
         'image_prefs',
         'agent_keys',
         'linear_installations',
         'linear_oauth_states',
         'linear_sessions',
+        'agent_feedback',
+        'fonts',
       ]),
     )
     const deferred = await client.query(

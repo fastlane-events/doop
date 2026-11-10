@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		000000000000000000000383 /* SelectionDOM.js in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000382 /* SelectionDOM.js */; };
+		000000000000000000000381 /* CanvasSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000380 /* CanvasSelection.swift */; };
+		000000000000000000000371 /* Fonts in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000370 /* Fonts */; };
 		000000000000000000000360 /* Core/CanvasSocket.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000361 /* Core/CanvasSocket.swift */; };
 		000000000000000000000352 /* Core/PendingFrameMoves.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000353 /* Core/PendingFrameMoves.swift */; };
 		000000000000000000000354 /* Core/ProviderSignIn.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000355 /* Core/ProviderSignIn.swift */; };
@@ -65,6 +68,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		000000000000000000000382 /* SelectionDOM.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = SelectionDOM.js; sourceTree = "<group>"; };
+		000000000000000000000380 /* CanvasSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasSelection.swift; sourceTree = "<group>"; };
+		000000000000000000000370 /* Fonts */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Fonts; sourceTree = "<group>"; };
+		000000000000000000000372 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		000000000000000000000361 /* Core/CanvasSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/CanvasSocket.swift; sourceTree = "<group>"; };
 		000000000000000000000353 /* Core/PendingFrameMoves.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/PendingFrameMoves.swift; sourceTree = "<group>"; };
 		000000000000000000000355 /* Core/ProviderSignIn.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core/ProviderSignIn.swift; sourceTree = "<group>"; };
@@ -143,6 +150,8 @@
 				00000000000000000000012D /* DoopClient.swift */,
 				00000000000000000000012E /* CanvasModel.swift */,
 				000000000000000000000130 /* NativeCanvasView.swift */,
+				000000000000000000000382 /* SelectionDOM.js */,
+				000000000000000000000380 /* CanvasSelection.swift */,
 				000000000000000000000310 /* Blitz/BlitzDocument.swift */,
 				000000000000000000000315 /* Blitz/AgentMark.swift */,
 				000000000000000000000311 /* Blitz/BlitzCanvasView.swift */,
@@ -154,6 +163,8 @@
 				000000000000000000000067 /* Core/ServerAddress.swift */,
 				000000000000000000000068 /* Core/ExportDirectory.swift */,
 				00000000000000000000006E /* Assets.xcassets */,
+				000000000000000000000370 /* Fonts */,
+				000000000000000000000372 /* Info.plist */,
 			);
 			path = Doop;
 			sourceTree = "<group>";
@@ -240,6 +251,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				0000000000000000000000D2 /* Assets.xcassets in Resources */,
+				000000000000000000000383 /* SelectionDOM.js in Resources */,
+				000000000000000000000371 /* Fonts in Resources */,
 				000000000000000000000332 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -292,6 +305,7 @@
 				000000000000000000000191 /* DoopClient.swift in Sources */,
 				000000000000000000000192 /* CanvasModel.swift in Sources */,
 				000000000000000000000194 /* NativeCanvasView.swift in Sources */,
+				000000000000000000000381 /* CanvasSelection.swift in Sources */,
 				000000000000000000000300 /* Blitz/BlitzDocument.swift in Sources */,
 				000000000000000000000305 /* Blitz/AgentMark.swift in Sources */,
 				000000000000000000000301 /* Blitz/BlitzCanvasView.swift in Sources */,
@@ -357,6 +371,7 @@
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = N29YR8ZK97;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Doop/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = doop;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
@@ -390,7 +405,7 @@
 					Metal,
 				);
 				SWIFT_OBJC_BRIDGING_HEADER = BlitzKit/include/doopblitz.h;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = design.doop.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -412,6 +427,7 @@
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = N29YR8ZK97;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Doop/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = doop;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
@@ -445,7 +461,7 @@
 					Metal,
 				);
 				SWIFT_OBJC_BRIDGING_HEADER = BlitzKit/include/doopblitz.h;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = design.doop.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -467,7 +483,7 @@
 				INFOPLIST_FILE = DoopActivity/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Doop Agent Status";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = design.doop.ios.activity;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -489,7 +505,7 @@
 				INFOPLIST_FILE = DoopActivity/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Doop Agent Status";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = design.doop.ios.activity;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;

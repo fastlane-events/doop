@@ -63,20 +63,18 @@ parts that apply to Doop are in `handleMcpRequest`:
 
 ### Annotation policy
 
-- `readOnlyHint: true` only for tools that change nothing about the design: reads, searches,
-  screenshots, export URLs. Reads that take `agent_name` (`get_canvas`, `get_frame_screenshot`,
-  `get_guidelines`, `list_guidelines`) also deliver, and thereby claim, the human feedback
-  addressed to that agent. That is bookkeeping about the caller's own inbox, not a change to
-  the canvas, so they stay read-only: the hint decides whether the host asks the person before
-  running a tool, and asking before every read would make the app unusable. `get_feedback`
-  exists to claim work, so it is the one feedback-claiming write.
-- `destructiveHint: true` for deletion and whole-content overwrites: `delete_frame`,
-  `set_canvas_pages` (can delete pages), `set_frame_html` and `set_guidelines` (replace). The
-  streaming path (`append_frame_html`, `start: true`) and `edit_frame_html` stay non-destructive:
-  they are how designs are made and ChatGPT would otherwise ask to confirm every section.
-- `openWorldHint: true` for anything reaching the public internet: website viewing/importing,
-  stock photos, icons, logos, inspiration, `upload_asset` and `import_psd` (fetch a URL).
-  `list_backgrounds` and `generate_image` are bounded services, so `false`.
+- `readOnlyHint: true` only for tools that change nothing anywhere: reads, searches,
+  screenshots, export URLs (`export_frame` returns a link). A read-only tool never claims human feedback: `withFeedbackNotice` only says requests are
+  waiting and points to `get_feedback`, which claims them (a stored write, so not read-only),
+  as do the tools that change the canvas. OpenAI rejected the first submission (2026-10-29)
+  partly because reads claimed feedback while marked read-only.
+- `destructiveHint: true` for anything that can remove or overwrite content: `delete_frame`,
+  `set_canvas_pages` (can delete pages), `set_frame_html`, `set_guidelines` and
+  `restore_frame_version` (replace), `append_frame_html` (`start: true` clears the frame) and
+  `edit_frame_html` (find-and-replace can delete content).
+- `openWorldHint: true` for anything reaching a third party: website viewing/importing, stock
+  photos, icons, logos, inspiration, `upload_asset` (fetches a URL),
+  `generate_image` (OpenAI). `list_backgrounds` serves Doop's own library, so `false`.
 
 ## The preview card (`server/chatgptApp.ts`)
 
@@ -129,9 +127,21 @@ see no difference.
   comparison table, connect steps), a ChatGPT section in `/docs/get-started#chatgpt`, docs nav
   and sitemap entries. The product server's proxy allowlist (`server/marketing.ts`) passes the
   new path through.
-- The in-app Connect modal's ChatGPT entry (`src/components/ConnectModal.tsx`) already documents
-  the Developer-mode connector path; once the directory listing is live its first step should
-  become "find Doop in the app directory".
+- The in-app Connect modal's ChatGPT entry (`src/components/ConnectModal.tsx`) opens
+  `https://chatgpt.com/plugins` with **Add to ChatGPT**, supplies a copyable instance `/mcp`
+  URL, and guides **+ → Add custom MCP server → OAuth → Create as a plugin**, sign-in,
+  installation and `@Doop` in a new chat. No file download is needed. This follows OpenAI's
+  [connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt), checked
+  2026-10-16. Account/workspace policy controls custom-server access.
+- The setup link does not prefill the server URL: no arbitrary-server prefill link is documented.
+  This repo has no verified published Doop plugin ID. Replace the setup link with the actual
+  directory listing only once one is published; do not derive an ID from the package name.
+- The public-URL flow filters HTTP and common local/private addresses. Those instances show
+  guidance to open a public HTTPS instance or configure Secure MCP Tunnel instead. Claude and
+  ChatGPT share `src/lib/mcpConnection.ts`: private-IP checks apply only to literal addresses,
+  so numeric-leading public DNS names and public IPv6 remain available. Dialog tests cover
+  these forms, including public/private IPv4-mapped IPv6. A hostname passing the filter is not
+  proof of public reachability; ChatGPT checks the real connection.
 
 ## The plugin package (`chatgpt-plugin/`)
 
@@ -155,10 +165,10 @@ the package; the dashboard rejects them.
    `hello@doop.design`. Review the privacy page against the checklist: data categories, purposes,
    recipients, retention, user controls.
 5. Test account: a fully featured demo account with sample canvases, password sign-in, no 2FA.
-6. Test in Developer mode first (Settings → Connectors → Advanced): connect, run a brief, check
-   that the preview card renders, that "Open in Doop" opens the canvas, and that a revoked token
-   re-triggers the sign-in.
-7. Submit. Annotation justifications are no longer required; appeal if automated review flags one.
+6. Test through [ChatGPT Plugins](https://chatgpt.com/plugins) first (**+ → Add custom MCP server**):
+   connect, install the resulting plugin, run a brief, check that the preview card renders,
+   that "Open in Doop" opens the canvas, and that a revoked token re-triggers the sign-in.
+7. Deploy, then **Rescan** the draft (the hints come from the scan, not the form), and submit. Put per-tool annotation justifications in "Additional Submission Context"; reviewer credentials live under **⋯ → Edit review information**.
 
 Example prompts for the listing:
 

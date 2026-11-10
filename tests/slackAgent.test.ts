@@ -16,6 +16,7 @@ import * as actions from '../server/actions.ts'
 import { onFeedback } from '../server/resident.ts'
 import { pickModel } from '../server/agentModel.ts'
 import { consumeResidentTask } from '../server/allowance.ts'
+import { isBanned } from '../server/auth.ts'
 
 vi.mock('../server/db/index.ts', async () => {
   const { PGlite } = await import('@electric-sql/pglite')
@@ -24,6 +25,7 @@ vi.mock('../server/db/index.ts', async () => {
   return { db: drizzle(new PGlite(), { schema }) }
 })
 vi.mock('../server/resident.ts', () => ({ onFeedback: vi.fn() }))
+vi.mock('../server/auth.ts', () => ({ isBanned: vi.fn().mockResolvedValue(false) }))
 vi.mock('../server/agentModel.ts', () => ({ pickModel: vi.fn().mockResolvedValue({ userId: 'owner' }) }))
 vi.mock('../server/allowance.ts', () => ({
   consumeResidentTask: vi.fn().mockResolvedValue({ ok: true, byoModel: true }),
@@ -109,6 +111,7 @@ beforeEach(async () => {
   eventId = `Ev${randomUUID().replace(/-/g, '').slice(0, 10)}`
   sent.length = 0
   vi.clearAllMocks()
+  vi.mocked(isBanned).mockResolvedValue(false)
   vi.mocked(pickModel).mockResolvedValue({ userId } as Awaited<ReturnType<typeof pickModel>>)
   vi.mocked(consumeResidentTask).mockResolvedValue({ ok: true, byoModel: true } as Awaited<
     ReturnType<typeof consumeResidentTask>
@@ -377,6 +380,79 @@ describe('design jobs', () => {
     const other = 'EvOTHERTHREAD'
     await receiveRequest(mention({ id: other, threadTs: '1700000000.000900' }))
     expect((await session(other)).followUp).toBe(false)
+  })
+
+  it('joins a follow-up to the thread’s first request even before that request has a canvas', async () => {
+    await receiveRequest(mention())
+    const followUpId = 'EvEARLYFOLLOWUP'
+    await receiveRequest(mention({ id: followUpId, text: `<@${botUserId}> make the button orange` }))
+    expect((await session(followUpId)).followUp).toBe(true)
+    await tickSlack()
+    await tickSlack()
+    const first = await session()
+    const second = await session(followUpId)
+    expect(first.status).toBe('running')
+    expect(second.status).toBe('running')
+    expect(second.followUp).toBe(true)
+    expect(second.canvasId).toBe(first.canvasId)
+    expect(await db.select().from(canvases)).toHaveLength(1)
+    expect(await db.select().from(tasks)).toHaveLength(2)
+  })
+
+  it('holds a follow-up while the thread’s first request is still on its way to a canvas', async () => {
+    await receiveRequest(mention())
+    await db
+      .update(slackSessions)
+      .set({ status: 'preparing', createdAt: Date.now() - 1000, updatedAt: Date.now() })
+      .where(eq(slackSessions.id, eventId))
+    const followUpId = 'EvWAITINGFOLLOWUP'
+    await receiveRequest(mention({ id: followUpId, text: `<@${botUserId}> make the button orange` }))
+    await tickSlack()
+    expect((await session(followUpId)).status).toBe('pending')
+    expect(consumeResidentTask).not.toHaveBeenCalled()
+    await db.update(slackSessions).set({ status: 'pending' }).where(eq(slackSessions.id, eventId))
+    await tickSlack()
+    await tickSlack()
+    const first = await session()
+    const second = await session(followUpId)
+    expect(first.status).toBe('running')
+    expect(second.status).toBe('running')
+    expect(second.canvasId).toBe(first.canvasId)
+    expect(await db.select().from(canvases)).toHaveLength(1)
+  })
+
+  it('stops a suspended installer’s work and refuses new requests', async () => {
+    await receiveRequest(mention())
+    await tickSlack()
+    const row = await session()
+    expect(row.status).toBe('running')
+    vi.mocked(isBanned).mockResolvedValue(true)
+    await tickSlack()
+    expect((await session()).status).toBe('canceled')
+    expect((await session()).reported).toBe(true)
+    expect(actions.getTasks(row.canvasId!).find((task) => task.id === row.taskId)?.failedAt).toBeTruthy()
+    const told = sent.filter((request) => request.method === 'chat.postMessage').at(-1)!
+    expect(String(told.body.text)).toContain('suspended')
+    const later = 'EvAFTERBAN'
+    await receiveRequest(mention({ id: later, threadTs: '1700000000.000500' }))
+    await tickSlack()
+    expect((await session(later)).status).toBe('canceled')
+    expect(consumeResidentTask).toHaveBeenCalledTimes(1)
+  })
+
+  it('times a run out an hour after it starts, not an hour after the mention arrived', async () => {
+    const twoHoursAgo = Date.now() - 2 * 60 * 60_000
+    await receiveRequest(mention())
+    await db.update(slackSessions).set({ createdAt: twoHoursAgo }).where(eq(slackSessions.id, eventId))
+    await tickSlack()
+    await tickSlack()
+    const row = await session()
+    expect(row.status).toBe('running')
+    const card = actions.getTasks(row.canvasId!).find((task) => task.id === row.taskId)!
+    card.startedAt = twoHoursAgo
+    await tickSlack()
+    expect((await session()).status).toBe('failed')
+    expect(card.failedAt).toBeTruthy()
   })
 
   it('answers a slash command in the channel and threads under its own message', async () => {

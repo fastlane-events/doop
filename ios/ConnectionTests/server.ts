@@ -23,6 +23,44 @@ const server = Bun.serve({
       if (id === 'missing') return socket.close(4404, 'not found')
       if (id === 'malformed') return socket.send(JSON.stringify({ type: 'init', canvas: 'invalid' }))
       if (id === 'retry' && count === 1) return socket.close(1011, 'transient fixture failure')
+      if (id === 'comments') {
+        const comment = {
+          id: 'canvas-comment',
+          canvasId: id,
+          pageId: 'page',
+          x: 10,
+          y: 20,
+          selector: '',
+          snippet: '',
+          from: 'Web',
+          text: 'Canvas pin',
+          at: 1,
+        }
+        socket.send(
+          JSON.stringify({
+            type: 'init',
+            canvas: { id, name: 'Comments', frames: [] },
+            tasks: [],
+            presences: [],
+            comments: [comment],
+          }),
+        )
+        socket.send(
+          JSON.stringify({
+            type: 'comment',
+            comment: { ...comment, id: 'reply', parentId: comment.id, text: 'Reply', at: 2 },
+          }),
+        )
+        socket.send(JSON.stringify({ type: 'comment', comment: { ...comment, resolvedAt: 20 } }))
+        socket.send(
+          JSON.stringify({
+            type: 'comment',
+            comment: { ...comment, id: 'frame-comment', frameId: 'f', text: 'Element pin', at: 3 },
+          }),
+        )
+        socket.send(JSON.stringify({ type: 'canvas:renamed', name: 'Still live' }))
+        return
+      }
       const frameHTML = id === 'oversized' ? 'x'.repeat(64 * 1024 * 1024 + 1) : html
       socket.send(
         JSON.stringify({
