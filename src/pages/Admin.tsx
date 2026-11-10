@@ -1,25 +1,37 @@
 import { useEffect, useMemo, useState } from 'react'
-import { adminApi, type AdminCanvas, type AdminUser } from '../lib/api'
+import {
+  adminApi,
+  type AdminAgentFeedback,
+  type AdminAgentFeedbackPage,
+  type AdminCanvas,
+  type AdminStats,
+  type AdminUser,
+} from '../lib/api'
 import { navigate } from '../App'
 import { timeAgo } from '../lib/time'
+import { railLayout } from '../components/AppRail'
+import { AccountMenu } from '../components/DashShell'
 import {
-  AccountMenu,
-  ConnectCard,
-  IconBack,
-  IconChevron,
-  IconGrid,
-  IconRules,
-  IconShare,
-} from '../components/DashShell'
+  BookmarkIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  GridIcon,
+  LockIcon,
+  MessageSquareIcon,
+  UsersIcon,
+} from '../components/ui/icons'
+import { SignInSettings } from '../components/SignInSettings'
 import { ScopedGuides, type ScopeGuidesApi } from '../components/GuideModal'
 import { Tabs, TabsList, TabsTrigger } from '../components/ui/tabs'
-import { cn } from '@/lib/utils'
 import { Button } from '../components/ui/button'
+import { ConfirmDialog } from '../components/ui/alert-dialog'
 import { Badge } from '../components/ui/badge'
-import { Input } from '../components/ui/input'
-import { Wordmark } from '../components/ui/wordmark'
-import { cardVariants } from '../components/ui/card'
+import { ToggleChipGroup, ToggleChipItem } from '../components/ui/toggle-chip'
+import type { AgentFeedbackKind } from '../../shared/agentFeedback'
+import { SearchField } from '../components/ui/search-field'
+import { MetaLine, Tile, TileBody, TileCover } from '../components/ui/tile'
 import { Skeleton } from '../components/ui/skeleton'
+import { FramePreview } from '../components/FramePreview'
 import {
   DashContent,
   DashHeader,
@@ -28,14 +40,36 @@ import {
   DashNavItem,
   DashSectionLabel,
   DashSidebar,
+  DashSidebarBrand,
   DashSubtitle,
   DashTitle,
 } from '../components/ui/dash'
+import type { LinkAccess } from '../../shared/canvasRole'
+import { useT, type PlainMessageKey } from '../lib/i18n'
 
-type Tab = 'canvases' | 'users' | 'rules'
+type SharedAccess = Exclude<LinkAccess, 'none'>
 
-/* rows and tiles share the Card surface */
-const cardShell = cn(cardVariants(), 'overflow-hidden text-left transition-[transform,box-shadow,border-color]')
+/* a shared canvas's link level: the badge, and the sentence its tooltip says */
+const LINK_BADGE = {
+  view: 'admin.linkView',
+  comment: 'admin.linkComment',
+  edit: 'admin.linkEdit',
+} as const satisfies Record<SharedAccess, PlainMessageKey>
+
+const LINK_TITLE = {
+  view: 'admin.linkAccessView',
+  comment: 'admin.linkAccessComment',
+  edit: 'admin.linkAccessEdit',
+} as const satisfies Record<SharedAccess, PlainMessageKey>
+
+type Tab = 'canvases' | 'users' | 'feedback' | 'signin' | 'rules'
+
+/* the header's search, for the tabs that are lists */
+const SEARCH_LABEL: Partial<Record<Tab, PlainMessageKey>> = {
+  canvases: 'admin.searchCanvases',
+  users: 'admin.searchAccounts',
+  feedback: 'admin.searchFeedback',
+}
 
 /**
  * The instance index: every canvas, every account. Read-only — the way to
@@ -43,13 +77,18 @@ const cardShell = cn(cardVariants(), 'overflow-hidden text-left transition-[tran
  * read-only, 15-minute) session as its owner rather than granting admins a
  * privileged read path through the canvas gate.
  *
- * Same shell as home and settings; the rail's middle carries the two indexes.
+ * Its own screen, like Settings: a rail of its panes and the way back,
+ * rather than the app rail with the instance tacked on under everything else.
  */
 export function Admin() {
+  const t = useT()
   const [data, setData] = useState<{ total: number; canvases: AdminCanvas[] } | null>(null)
   const [users, setUsers] = useState<AdminUser[] | null>(null)
-  const [stats, setStats] = useState<{ users: number; canvases: number; frames: number } | null>(null)
+  const [stats, setStats] = useState<AdminStats | null>(null)
   const [tab, setTab] = useState<Tab>('canvases')
+  /* the ban/unban awaiting "are you sure" — an in-app dialog, since
+     window.confirm is a silent "cancel" in the desktop shell's webview */
+  const [confirmBan, setConfirmBan] = useState<{ user: AdminUser; banned: boolean } | null>(null)
   const [q, setQ] = useState('')
   const [denied, setDenied] = useState(false)
 
@@ -76,12 +115,6 @@ export function Admin() {
   }
 
   async function setBanned(u: AdminUser, banned: boolean) {
-    const ok = window.confirm(
-      banned
-        ? `Ban ${u.name} (${u.email})? They are signed out everywhere and cannot sign in or use MCP until unbanned.`
-        : `Unban ${u.name} (${u.email})?`,
-    )
-    if (!ok) return
     try {
       if (banned) await adminApi.ban(u.id)
       else await adminApi.unban(u.id)
@@ -95,20 +128,17 @@ export function Admin() {
     return (
       <div className="h-full overflow-y-auto [background:radial-gradient(circle,var(--dot)_1px,transparent_1px)_0_0/26px_26px,var(--paper)]">
         <div className="mx-auto max-w-[1060px] px-10 pt-[72px] pb-[120px]">
-          <h1 className="mt-16 font-serif text-[clamp(38px,4.8vw,60px)] font-normal leading-none tracking-[-0.02em]">
-            Not found
-          </h1>
-          <p className="mt-3.5 max-w-[44em] text-[15px] leading-[1.6] text-ink-soft">
-            This page does not exist for this account.
-          </p>
+          <DashTitle className="mt-16">{t('admin.notFound')}</DashTitle>
+          <p className="mt-3.5 max-w-[44em] text-lead leading-[1.6] text-ink-soft">{t('admin.notFoundBody')}</p>
           <Button variant="ghost" className="mt-5" onClick={() => navigate('/')}>
-            Back
+            {t('admin.back')}
           </Button>
         </div>
       </div>
     )
   }
 
+  const searchLabel = SEARCH_LABEL[tab]
   const needle = q.trim().toLowerCase()
   const canvases = (data?.canvases ?? []).filter(
     (c) =>
@@ -122,106 +152,123 @@ export function Admin() {
   )
 
   return (
-    <DashLayout>
-      <DashSidebar>
-        <Wordmark size="sm" className="px-2 pb-5 text-[17px]">
-          Doop <Badge tone="admin">admin</Badge>
-        </Wordmark>
-
-        <Button
-          variant="ghost"
-          className="w-full justify-start gap-[9px] rounded-[9px] px-2.5 py-2 text-[13px] text-ink-soft hover:bg-paper hover:text-ink"
-          onClick={() => navigate('/')}
-        >
-          <IconBack /> Back to my canvases
-        </Button>
-
-        <DashSectionLabel>Instance</DashSectionLabel>
+    <DashLayout className={railLayout}>
+      <DashSidebar variant="rail">
+        <DashSidebarBrand />
+        <nav className="flex flex-col gap-0.5">
+          <DashNavItem density="rail" icon={<ChevronLeftIcon size="rail" />} onClick={() => navigate('/')}>
+            {t('admin.backToCanvases')}
+          </DashNavItem>
+        </nav>
+        <DashSectionLabel density="rail">{t('admin.instance')}</DashSectionLabel>
         <nav className="flex flex-col gap-0.5">
           <DashNavItem
-            icon={<IconGrid />}
+            density="rail"
+            icon={<GridIcon size="rail" />}
             count={stats?.canvases ?? ''}
             active={tab === 'canvases'}
             onClick={() => setTab('canvases')}
           >
-            Canvases
+            {t('admin.canvases')}
           </DashNavItem>
           <DashNavItem
-            icon={<IconShare />}
+            density="rail"
+            icon={<UsersIcon size="rail" />}
             count={stats?.users ?? ''}
             active={tab === 'users'}
             onClick={() => setTab('users')}
           >
-            Accounts
+            {t('admin.accounts')}
           </DashNavItem>
-          <DashNavItem icon={<IconRules />} active={tab === 'rules'} onClick={() => setTab('rules')}>
+          <DashNavItem
+            density="rail"
+            icon={<MessageSquareIcon size="rail" />}
+            count={stats?.agentFeedback ?? ''}
+            active={tab === 'feedback'}
+            onClick={() => setTab('feedback')}
+          >
+            {t('admin.feedbackNav')}
+          </DashNavItem>
+          <DashNavItem
+            density="rail"
+            icon={<LockIcon size="rail" />}
+            active={tab === 'signin'}
+            onClick={() => setTab('signin')}
+          >
+            {t('admin.signInNav')}
+          </DashNavItem>
+          <DashNavItem
+            density="rail"
+            icon={<BookmarkIcon size="rail" />}
+            active={tab === 'rules'}
+            onClick={() => setTab('rules')}
+          >
             Rules
           </DashNavItem>
         </nav>
-
-        <div className="min-h-6 flex-1" />
-        <ConnectCard />
+        <div className="mt-auto flex items-center gap-2.5 px-1 pt-4">
+          <AccountMenu face side="top" align="start" />
+        </div>
       </DashSidebar>
 
-      <DashMain>
-        <DashHeader className="max-md:min-h-[104px]">
-          <nav className="flex items-center gap-2 text-[13px] text-ink-faint" aria-label="Breadcrumb">
+      <DashMain className="[background:var(--paper)]">
+        <DashHeader variant="bare" className="max-md:min-h-[104px]">
+          <nav className="flex items-center gap-2 text-body text-ink-faint" aria-label={t('admin.breadcrumb')}>
             <Button
               variant="link"
               size="sm"
-              className="px-0 py-0 text-[13px] font-normal text-ink-faint hover:text-ink"
+              className="px-0 py-0 text-body font-normal text-ink-faint hover:text-ink"
               onClick={() => navigate('/')}
             >
-              Home
+              {t('admin.home')}
             </Button>
-            <IconChevron />
-            <b className="font-semibold text-ink">Admin</b>
+            <ChevronRightIcon size={12} />
+            <b className="font-semibold text-ink">{t('admin.admin')}</b>
           </nav>
-          <label className="order-2 flex h-10 max-w-none flex-1 basis-full items-center gap-[9px] rounded-[10px] border border-line bg-surface px-[11px] text-ink-faint focus-within:border-ink-faint md:order-none md:h-[34px] md:max-w-[400px] md:basis-auto">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="11" cy="11" r="7" />
-              <path d="m20 20-3.2-3.2" />
-            </svg>
-            <Input
-              variant="bare"
-              inputSize="auto"
-              className="flex-1 md:text-[13px]"
+          {searchLabel && (
+            <SearchField
+              size="header"
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder={tab === 'canvases' ? 'Search canvases or owners…' : 'Search accounts…'}
-              aria-label={tab === 'canvases' ? 'Search canvases or owners' : 'Search accounts'}
+              placeholder={`${t(searchLabel)}…`}
+              aria-label={t(searchLabel)}
             />
-          </label>
-          <span className="flex-1" />
-          <AccountMenu />
+          )}
         </DashHeader>
 
         <DashContent>
           <div className="flex items-start gap-4 md:items-end">
             <div>
               <DashTitle>
-                Everything on this instance<em className="not-italic text-brand">.</em>
+                {t('admin.title')}
+                <em className="not-italic text-brand">.</em>
               </DashTitle>
               <DashSubtitle>
                 {stats
-                  ? `${stats.users} ${stats.users === 1 ? 'account' : 'accounts'} · ${stats.canvases} ${
-                      stats.canvases === 1 ? 'canvas' : 'canvases'
-                    } · ${stats.frames} ${stats.frames === 1 ? 'frame' : 'frames'}`
+                  ? `${t('admin.accountCount', { count: stats.users })} · ${t('admin.canvasCount', {
+                      count: stats.canvases,
+                    })} · ${t('admin.frameCount', { count: stats.frames })}`
                   : '…'}
               </DashSubtitle>
             </div>
           </div>
 
           <Tabs value={tab} onValueChange={(next) => setTab(next as Tab)} className="mt-4 flex md:hidden">
-            <TabsList className="h-10 w-full border border-line bg-surface p-1 shadow-card">
+            <TabsList variant="card">
               <TabsTrigger value="canvases">
-                <IconGrid /> Canvases · {stats?.canvases ?? '…'}
+                <GridIcon size="rail" /> {t('admin.canvasesTab', { count: stats?.canvases ?? '…' })}
               </TabsTrigger>
               <TabsTrigger value="users">
-                <IconShare /> Accounts · {stats?.users ?? '…'}
+                <UsersIcon size="rail" /> {t('admin.accountsTab', { count: stats?.users ?? '…' })}
+              </TabsTrigger>
+              <TabsTrigger value="feedback">
+                <MessageSquareIcon size="rail" /> {t('admin.feedbackTab', { count: stats?.agentFeedback ?? '…' })}
+              </TabsTrigger>
+              <TabsTrigger value="signin">
+                <LockIcon size="rail" /> {t('admin.signInTab')}
               </TabsTrigger>
               <TabsTrigger value="rules">
-                <IconRules /> Rules
+                <BookmarkIcon size="rail" /> Rules
               </TabsTrigger>
             </TabsList>
           </Tabs>
@@ -232,44 +279,33 @@ export function Admin() {
             <>
               {data && data.total > data.canvases.length && (
                 <div className="mt-[18px] flex flex-wrap items-center gap-2.5 text-xs text-ink-faint">
-                  <span>
-                    Showing the {data.canvases.length} most recently updated of {data.total}
-                  </span>
+                  <span>{t('admin.showingRecent', { shown: data.canvases.length, total: data.total })}</span>
                 </div>
               )}
               <div className="mt-4 grid grid-cols-[minmax(0,1fr)] gap-3.5 xs:grid-cols-[repeat(auto-fill,minmax(214px,1fr))] md:gap-4">
-                {data === null &&
-                  [0, 1, 2, 3].map((i) => <Skeleton key={i} index={i} className={cn(cardShell, 'min-h-[230px]')} />)}
+                {data === null && [0, 1, 2, 3].map((i) => <Skeleton key={i} index={i} shape="tile" aspect="4/3" />)}
                 {canvases.map((c) => (
-                  <div key={c.id} className={cn(cardShell, 'flex flex-col')}>
-                    <div className="relative grid aspect-[4/3] place-items-center overflow-hidden border-b border-line-soft [background:radial-gradient(circle,var(--dot)_1px,transparent_1px)_0_0/18px_18px,var(--paper-deep)]">
-                      <CanvasPreview frameId={c.previewFrameId} />
-                    </div>
-                    <div className="flex flex-1 flex-col px-3 pt-2.5 pb-3">
-                      <div className="truncate font-display text-[13.5px] font-semibold">{c.name}</div>
-                      <div className="mt-[5px] flex min-h-0 flex-wrap content-start items-center gap-1.5 text-[11.5px] text-ink-faint xs:min-h-[30px]">
-                        <span>{c.owner ? c.owner.name : 'unclaimed'}</span>
-                        <span className="opacity-60">·</span>
-                        <span>
-                          {c.frameCount} frame{c.frameCount === 1 ? '' : 's'}
-                        </span>
-                        <span className="opacity-60">·</span>
+                  <Tile key={c.id} tone="solid">
+                    <TileCover aspect="4/3">
+                      <FramePreview frameId={c.previewFrameId} />
+                    </TileCover>
+                    <TileBody className="flex flex-1 flex-col">
+                      <div className="truncate font-display text-copy font-semibold">{c.name}</div>
+                      <MetaLine
+                        className="mt-[5px] min-h-0 flex-wrap content-start xs:min-h-[30px]"
+                        trailing={
+                          c.linkAccess !== 'none' && (
+                            <Badge className="px-[5px] py-px text-micro" title={t(LINK_TITLE[c.linkAccess])}>
+                              {t(LINK_BADGE[c.linkAccess])}
+                            </Badge>
+                          )
+                        }
+                      >
+                        <span>{c.owner ? c.owner.name : t('admin.unclaimed')}</span>
+                        <span>{t('admin.frameCount', { count: c.frameCount })}</span>
                         <span>{timeAgo(c.updatedAt)}</span>
-                        {c.linkAccess === 'edit' && (
-                          <Badge
-                            className="px-[5px] py-px text-[10px]"
-                            title="Anyone with the link can edit this canvas"
-                          >
-                            link on
-                          </Badge>
-                        )}
-                        {c.memberCount > 0 && (
-                          <>
-                            <span className="opacity-60">·</span>
-                            <span>{c.memberCount} invited</span>
-                          </>
-                        )}
-                      </div>
+                        {c.memberCount > 0 && <span>{t('admin.invited', { count: c.memberCount })}</span>}
+                      </MetaLine>
                       {c.owner && (
                         <Button
                           variant="ghost"
@@ -277,47 +313,53 @@ export function Admin() {
                           className="mt-auto self-start"
                           onClick={() => viewAs(c.owner!.id)}
                         >
-                          View as {c.owner.name.split(' ')[0]}
+                          {t('admin.viewAsName', { name: c.owner.name.split(' ')[0] ?? '' })}
                         </Button>
                       )}
-                    </div>
-                  </div>
+                    </TileBody>
+                  </Tile>
                 ))}
               </div>
             </>
+          ) : tab === 'feedback' ? (
+            <AgentFeedbackList q={q} />
+          ) : tab === 'signin' ? (
+            <SignInSettings />
           ) : (
-            <div className="mt-4 overflow-hidden rounded-[14px] border border-line bg-surface shadow-card">
-              {users === null && <p className="mt-7 text-[13.5px] text-ink-soft">…</p>}
+            <div className="mt-4 overflow-hidden rounded-panel border border-line bg-surface shadow-card">
+              {users === null && <p className="mt-7 text-copy text-ink-soft">…</p>}
               {shownUsers.map((u) => (
                 <div
                   key={u.id}
                   className="flex flex-col items-stretch justify-between gap-2.5 border-b border-line-soft p-3.5 last:border-b-0 md:flex-row md:items-center md:gap-4 md:px-[18px] md:py-[13px]"
                 >
                   <div>
-                    <div className="flex flex-wrap items-center gap-2 font-display text-[14.5px] font-semibold">
+                    <div className="flex flex-wrap items-center gap-2 font-display text-copy font-semibold">
                       {u.name}
-                      {u.role === 'admin' && <Badge tone="admin">admin</Badge>}
-                      {u.banned && <Badge tone="banned">banned</Badge>}
+                      {u.role === 'admin' && <Badge tone="admin">{t('admin.roleAdmin')}</Badge>}
+                      {u.banned && <Badge tone="banned">{t('admin.banned')}</Badge>}
                     </div>
-                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[12.5px] text-ink-faint">
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-body text-ink-faint">
                       <span>{u.email}</span>
                       <span>·</span>
-                      <span>
-                        {u.canvasCount} {u.canvasCount === 1 ? 'canvas' : 'canvases'}
-                      </span>
+                      <span>{t('admin.canvasCount', { count: u.canvasCount })}</span>
                       <span>·</span>
-                      <span>joined {timeAgo(u.createdAt)}</span>
+                      <span>{t('admin.joined', { time: timeAgo(u.createdAt) })}</span>
                     </div>
                   </div>
                   {u.role !== 'admin' && (
                     <div className="flex flex-wrap items-center gap-2">
                       {!u.banned && (
                         <Button variant="ghost" size="sm" onClick={() => viewAs(u.id)}>
-                          View as
+                          {t('admin.viewAs')}
                         </Button>
                       )}
-                      <Button variant={u.banned ? 'ghost' : 'danger'} size="sm" onClick={() => setBanned(u, !u.banned)}>
-                        {u.banned ? 'Unban' : 'Ban'}
+                      <Button
+                        variant={u.banned ? 'ghost' : 'danger'}
+                        size="sm"
+                        onClick={() => setConfirmBan({ user: u, banned: !u.banned })}
+                      >
+                        {u.banned ? t('admin.unban') : t('admin.ban')}
                       </Button>
                     </div>
                   )}
@@ -327,6 +369,22 @@ export function Admin() {
           )}
         </DashContent>
       </DashMain>
+      <ConfirmDialog
+        open={!!confirmBan}
+        onOpenChange={(open) => !open && setConfirmBan(null)}
+        title={t(confirmBan?.banned ? 'admin.banTitle' : 'admin.unbanTitle', {
+          name: confirmBan?.user.name ?? '',
+          email: confirmBan?.user.email ?? '',
+        })}
+        description={confirmBan?.banned ? t('admin.banDescription') : undefined}
+        confirmLabel={confirmBan?.banned ? t('admin.ban') : t('admin.unban')}
+        destructive={confirmBan?.banned}
+        onConfirm={() => {
+          const target = confirmBan
+          setConfirmBan(null)
+          if (target) void setBanned(target.user, target.banned)
+        }}
+      />
     </DashLayout>
   )
 }
@@ -354,22 +412,127 @@ function InstanceRules() {
   )
 }
 
-/** Same contract as the Home dashboard's Preview: a failed render must look
- *  different from an empty canvas, and cards request the cheap ?preview
- *  render rather than the full-size og:image one. */
-function CanvasPreview({ frameId }: { frameId?: string }) {
-  /* which frame failed, not whether — a new previewFrameId must retry
-     rather than inherit the old frame's failure */
-  const [failedId, setFailedId] = useState<string | null>(null)
-  if (!frameId) return <span className="text-[12px] text-ink-faint">empty canvas</span>
-  if (failedId === frameId) return <span className="text-[12px] text-ink-faint">preview unavailable</span>
+type KindFilter = 'all' | AgentFeedbackKind
+
+/** What agents sent the Doop team: issues (report_issue) and ideas or praise
+ *  (share_feedback). Search and the kind filter run on the server, so older
+ *  reports stay findable; the list loads a page at a time. */
+function AgentFeedbackList({ q }: { q: string }) {
+  const [kind, setKind] = useState<KindFilter>('all')
+  const [search, setSearch] = useState(q.trim())
+  /* one request per pause in typing, not per keystroke */
+  useEffect(() => {
+    const timer = setTimeout(() => setSearch(q.trim()), 250)
+    return () => clearTimeout(timer)
+  }, [q])
+  /* a new filter or search starts the pages over: a fresh FeedbackPages */
+  return <FeedbackPages key={`${kind}\n${search}`} kind={kind} search={search} onKind={setKind} />
+}
+
+function FeedbackPages({
+  kind,
+  search,
+  onKind,
+}: {
+  kind: KindFilter
+  search: string
+  onKind: (kind: KindFilter) => void
+}) {
+  const t = useT()
+  const [reports, setReports] = useState<AdminAgentFeedback[]>([])
+  const [page, setPage] = useState<AdminAgentFeedbackPage | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [failed, setFailed] = useState(false)
+
+  function load(before?: AdminAgentFeedback) {
+    setLoading(true)
+    setFailed(false)
+    adminApi
+      .agentFeedback({ kind: kind === 'all' ? undefined : kind, q: search || undefined, before })
+      .then((next) => {
+        setPage(next)
+        setReports((shown) => (before ? [...shown, ...next.reports] : next.reports))
+      })
+      .catch(() => setFailed(true))
+      .finally(() => setLoading(false))
+  }
+
+  // eslint-disable-next-line react/exhaustive-deps -- the first page loads once; a new filter remounts this component
+  useEffect(() => load(), [])
+
+  const counts = page?.counts
+  const total = counts ? counts.issue + counts.feedback : null
+  if (total === 0 && !search) return <p className="mt-7 text-copy text-ink-soft">{t('admin.feedbackEmpty')}</p>
   return (
-    <img
-      className="h-full w-full object-cover object-top"
-      src={`/i/${frameId}.jpg?preview`}
-      alt=""
-      loading="lazy"
-      onError={() => setFailedId(frameId)}
-    />
+    <>
+      <ToggleChipGroup
+        className="mt-4 gap-1.5"
+        aria-label={t('admin.feedbackKind')}
+        value={kind}
+        onValueChange={(next) => next && onKind(next as KindFilter)}
+      >
+        <ToggleChipItem value="all" size="sm">
+          {t('admin.feedbackAll', { count: total ?? '…' })}
+        </ToggleChipItem>
+        <ToggleChipItem value="issue" size="sm">
+          {t('admin.feedbackIssues', { count: counts?.issue ?? '…' })}
+        </ToggleChipItem>
+        <ToggleChipItem value="feedback" size="sm">
+          {t('admin.feedbackIdeas', { count: counts?.feedback ?? '…' })}
+        </ToggleChipItem>
+      </ToggleChipGroup>
+      {reports.length > 0 && (
+        <div className="mt-3 overflow-hidden rounded-panel border border-line bg-surface shadow-card">
+          {reports.map((f) => (
+            <div key={f.id} className="border-b border-line-soft p-3.5 last:border-b-0 md:px-[18px] md:py-[13px]">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone={f.kind === 'issue' ? 'accent' : 'success'}>
+                  {f.kind === 'issue' ? t('admin.feedbackIssue') : t('admin.feedbackIdea')}
+                </Badge>
+                <Badge tone="outline">{f.category.replaceAll('_', ' ')}</Badge>
+                {f.tool && <span className="font-mono text-caption text-ink-soft">{f.tool}</span>}
+              </div>
+              <p className="mt-1.5 text-copy whitespace-pre-wrap text-ink">{f.message}</p>
+              <MetaLine className="mt-1.5">
+                <span>{f.agentName ?? t('admin.unnamedAgent')}</span>
+                <span>{f.source === 'resident' ? 'Doop Agent' : (f.client ?? 'MCP')}</span>
+                {f.user && <span>{f.user.email}</span>}
+                {f.canvasId && <span className="font-mono">{f.canvasId}</span>}
+                <span>{timeAgo(f.at)}</span>
+              </MetaLine>
+            </div>
+          ))}
+        </div>
+      )}
+      {page && !loading && !failed && reports.length === 0 && (
+        <p className="mt-4 text-copy text-ink-soft">{t('admin.feedbackNoMatch')}</p>
+      )}
+      <div className="mt-3 flex flex-wrap items-center gap-2.5 text-body text-ink-faint">
+        {failed ? (
+          <>
+            <span className="text-accent-ink">{t('admin.feedbackLoadFailed')}</span>
+            <Button variant="ghost" size="sm" onClick={() => load(reports.at(-1))}>
+              {t('admin.tryAgain')}
+            </Button>
+          </>
+        ) : loading ? (
+          <span>{t('admin.loading')}</span>
+        ) : (
+          page?.hasMore && (
+            <>
+              <span>
+                {t('admin.showingNewest', {
+                  shown: reports.length,
+                  total: (kind === 'all' ? total : kind === 'issue' ? counts?.issue : counts?.feedback) ?? '…',
+                })}
+              </span>
+              <Button variant="ghost" size="sm" onClick={() => load(reports.at(-1))}>
+                {t('admin.loadOlder')}
+              </Button>
+            </>
+          )
+        )}
+      </div>
+    </>
   )
 }

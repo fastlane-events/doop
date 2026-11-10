@@ -17,7 +17,7 @@ export function SourceLink() {
       href={url}
       target="_blank"
       rel="noopener noreferrer"
-      className="fixed right-2 bottom-[calc(4px+env(safe-area-inset-bottom))] z-[800] rounded-[6px] bg-paper/80 px-1.5 py-0.5 text-[10.5px] text-ink-faint opacity-70 backdrop-blur-[4px] hover:text-ink hover:opacity-100 print:hidden"
+      className="fixed right-2 bottom-[calc(4px+env(safe-area-inset-bottom))] z-[800] rounded-row bg-paper/80 px-1.5 py-0.5 text-micro text-ink-faint opacity-70 backdrop-blur-[4px] hover:text-ink hover:opacity-100 print:hidden"
     >
       Source code
     </a>

@@ -24,7 +24,7 @@ function ContextMenuContent({ className, ...props }: React.ComponentProps<typeof
         data-slot="context-menu-content"
         collisionPadding={8}
         className={cn(
-          'z-[70] min-w-[190px] rounded-[10px] border border-line bg-surface p-[5px] shadow-pop',
+          'z-[70] min-w-[190px] rounded-[12px] bg-surface p-1.5 shadow-pop',
           'animate-[chip-in_0.18s_ease] data-[state=closed]:animate-none',
           className,
         )}
@@ -46,7 +46,7 @@ function ContextMenuItem({
         menuItemVariants({ tone }),
         /* Radix drives hover AND keyboard focus through data-highlighted, so
            the two states cannot drift apart */
-        'cursor-pointer outline-none data-[highlighted]:bg-line-soft data-[disabled]:pointer-events-none data-[disabled]:text-ink-faint',
+        'cursor-pointer outline-none data-[highlighted]:bg-sub data-[disabled]:pointer-events-none data-[disabled]:text-ink-faint',
         tone === 'danger' && 'data-[highlighted]:bg-accent-ink/10',
         className,
       )}
@@ -59,7 +59,7 @@ function ContextMenuSeparator({ className, ...props }: React.ComponentProps<type
   return (
     <ContextMenuPrimitive.Separator
       data-slot="context-menu-separator"
-      className={cn('my-[5px] h-px bg-line-soft', className)}
+      className={cn('my-1.5 h-px bg-line-soft', className)}
       {...props}
     />
   )

@@ -1,40 +1,38 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createServer, type ViteDevServer } from 'vite'
-import type { Browser, Page } from 'puppeteer-core'
-import { findBrowserPath, getBrowser } from '../server/screenshot'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import type { Page } from 'puppeteer-core'
+import { findBrowserPath } from '../server/screenshot'
+import { pagePerTest, serveBuilt, type BuiltServer } from './browser'
 import { freePort, startServer, type Server } from './harness'
 
 describe.skipIf(!findBrowserPath())('page list controls and keyboard history', () => {
-  let vite: ViteDevServer
+  let web: BuiltServer
   let server: Server
-  let browser: Browser
+  const pages = pagePerTest()
   let page: Page
+  let origin: string
+  /* every test signs up as someone new, so each works on a canvas of its own */
+  let accounts = 0
   beforeAll(async () => {
-    /* vite needs the server's port for its proxy and the server needs vite's
+    /* the web server needs the backend's port for its proxy and the backend needs its
        origin as BETTER_AUTH_URL, so the port is picked before either starts */
     const port = await freePort()
-    vite = await createServer({
-      logLevel: 'error',
-      server: {
-        port: 0,
-        proxy: {
-          '/api': { target: `http://localhost:${port}` },
-          '/ws': { target: `ws://localhost:${port}`, ws: true },
-        },
-      },
+    web = await serveBuilt({
+      '/api': { target: `http://localhost:${port}` },
+      '/ws': { target: `ws://localhost:${port}`, ws: true },
     })
-    await vite.listen()
-    const origin = vite.resolvedUrls!.local[0]!.replace(/\/$/, '')
+    origin = web.origin
     server = await startServer({ PORT: String(port), BETTER_AUTH_URL: origin })
-    browser = await getBrowser()
-    page = await browser.newPage()
+  }, 60_000)
+  beforeEach(async () => {
+    page = await pages.open()
+    page.setDefaultTimeout(10_000)
     await page.setViewport({ width: 1400, height: 900 })
     await page.goto(origin)
-    const canvasId = await page.evaluate(async () => {
+    const canvasId = await page.evaluate(async (email) => {
       const signup = await fetch('/api/auth/sign-up/email', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'Pages Tester', email: 'page-controls@test.dev', password: 'password12345' }),
+        body: JSON.stringify({ name: 'Pages Tester', email, password: 'password12345' }),
       })
       if (!signup.ok) throw new Error(await signup.text())
       const canvas = await (
@@ -45,36 +43,57 @@ describe.skipIf(!findBrowserPath())('page list controls and keyboard history', (
         })
       ).json()
       return canvas.id
-    })
+    }, `page-controls-${++accounts}@test.dev`)
     await page.goto(`${origin}/c/${canvasId}`)
-    await page.waitForSelector('[role="tab"][data-state="active"]')
+    /* the Layers heading paints before the canvas's pages arrive; the first
+       assertion counts page rows, so wait for the list itself */
+    await page.waitForSelector('[data-slot="frame-section-heading"]')
+    await page.waitForSelector('[data-page-id]')
   }, 60_000)
   afterAll(async () => {
-    await page?.close()
-    await browser?.close()
-    await vite?.close()
+    await web?.close()
     server?.stop()
   })
 
   async function shortcut(redo = false) {
+    // The WebSocket can paint the result before the HTTP response releases
+    // history's busy guard. Wait for this shortcut's own request to finish
+    // before sending the next one, including when an earlier save is in flight.
+    const completed = page
+      .waitForRequest(
+        (request) =>
+          ['PUT', 'PATCH', 'POST', 'DELETE'].includes(request.method()) &&
+          /^\/api\/(canvases|frames)\//.test(new URL(request.url()).pathname),
+      )
+      .then(async (request) => {
+        const response =
+          request.response() ?? (await page.waitForResponse((response) => response.request() === request))
+        await response.text()
+        expect(response.ok()).toBe(true)
+      })
     await page.keyboard.down('Meta')
     if (redo) await page.keyboard.down('Shift')
     await page.keyboard.press('z')
     if (redo) await page.keyboard.up('Shift')
     await page.keyboard.up('Meta')
+    await completed
+    await page.evaluate(() => new Promise(requestAnimationFrame))
   }
 
   it('drags pages, double-clicks to rename, and restores a deleted page and frame with Cmd+Z', async () => {
+    // Exercise the ordering that made this test race on CI: broadcasts land first.
+    await page.emulateNetworkConditions({ offline: false, download: -1, upload: -1, latency: 150 })
     const framePlus = await page.$eval('button[aria-label="New frame"] svg', (el) => el.outerHTML)
     const typography = (element: Element) => {
       const style = getComputedStyle(element)
       return [style.fontFamily, style.fontSize, style.fontWeight, style.letterSpacing, style.textTransform]
     }
     const frameTypography = await page.$eval('[data-slot="frame-section-heading"]', typography)
-    expect(await page.$('[data-page-id]')).toBeNull()
-    await page.click('[role="tab"][data-state="inactive"]')
+    /* pages sit above the frames, Figma-style, with the search underneath both */
+    expect(await page.$$('[data-page-id]')).toHaveLength(1)
     await page.waitForSelector('button[aria-label="Add page"]')
-    expect(await page.$('input[placeholder="Search layers"]')).toBeNull()
+    expect(await page.$('input[placeholder="Search layers"]')).not.toBeNull()
+    expect(await page.$('[data-slot="frame-section-heading"]')).not.toBeNull()
     expect(await page.$eval('button[aria-label="Add page"] svg', (el) => el.outerHTML)).toBe(framePlus)
     expect(await page.$eval('[data-slot="page-section-heading"]', typography)).toEqual(frameTypography)
     await page.click('button[aria-label="Add page"]')
@@ -98,6 +117,14 @@ describe.skipIf(!findBrowserPath())('page list controls and keyboard history', (
     )
     await page.click('[data-page-id] > button:first-of-type', { count: 2 })
     await page.waitForSelector('input[aria-label="Page name"]')
+    /* the row being renamed is the active one (a grey fill); the input reads
+       as ink on its own white surface, not as text on the row's fill */
+    expect(
+      await page.$eval('input[aria-label="Page name"]', (input) => [
+        getComputedStyle(input).color === getComputedStyle(document.body).color,
+        getComputedStyle(input).backgroundColor !== getComputedStyle(input.closest('[data-page-id]')!).backgroundColor,
+      ]),
+    ).toEqual([true, true])
     await page.type('input[aria-label="Page name"]', 'Ideas')
     await page.keyboard.press('Enter')
     await page.waitForFunction(() => document.querySelector('[data-page-id]')?.textContent?.includes('Ideas'))
@@ -108,15 +135,14 @@ describe.skipIf(!findBrowserPath())('page list controls and keyboard history', (
       '[data-page-id] button[aria-current="page"]',
       (button) => getComputedStyle(button.parentElement!).backgroundColor,
     )
-    await page.click('[role="tab"][data-state="inactive"]')
     await page.click('button[aria-label="New frame"]')
     await page.waitForSelector('iframe[data-doop-frame]')
+    await page.waitForSelector('[role="treeitem"][aria-selected="true"]')
     expect(selectedColor).toBe(
       await page.$eval('[role="treeitem"][aria-selected="true"]', (row) => getComputedStyle(row).backgroundColor),
     )
     await page.keyboard.press('Delete')
     await page.waitForFunction(() => document.querySelectorAll('iframe[data-doop-frame]').length === 0)
-    await page.click('[role="tab"][data-state="inactive"]')
     await page.screenshot({ path: '/tmp/doop-pages-controls.png' })
     await page.click('[data-page-id] button[aria-current="page"]', { button: 'right' })
     await page.waitForSelector('[role="menuitem"]')
@@ -141,5 +167,95 @@ describe.skipIf(!findBrowserPath())('page list controls and keyboard history', (
     await page.type('input[aria-label="Page name"]', 'Main')
     await page.keyboard.press('Enter')
     await page.waitForFunction(() => document.querySelector('[data-page-id]')?.textContent?.includes('Main'))
+  }, 20_000)
+
+  it('moves a selected frame through the page picker and undoes the move', async () => {
+    /* the page names are the server's to choose, so the destination's is read
+       rather than assumed */
+    const pageCount = (await page.$$('[data-page-id]')).length
+    await page.click('button[aria-label="Add page"]')
+    await page.waitForFunction((n) => document.querySelectorAll('[data-page-id]').length === n + 1, {}, pageCount)
+    await page.waitForFunction(
+      () => !document.querySelector<HTMLButtonElement>('button[aria-label="Add page"]')!.disabled,
+    )
+    const source = await page.$eval(
+      '[aria-current="page"]',
+      (button) => button.closest<HTMLElement>('[data-page-id]')!.dataset.pageId!,
+    )
+    const destination = await page.$eval(
+      '[data-page-id] > button:first-of-type:not([aria-current="page"])',
+      (button) => button.textContent!,
+    )
+    await page.click('button[aria-label="New frame"]')
+    await page.waitForSelector('iframe[data-doop-frame]')
+    /* the room's broadcast can paint the frame before the create response
+       selects it, and the picker only shows for a selection */
+    await page.waitForSelector('[aria-label="Move selection to page"]:not([disabled])')
+    await page.click('[aria-label="Move selection to page"]')
+    await page.waitForSelector('[role="option"]')
+    expect(await page.$$('[role="option"]')).toHaveLength(1)
+    expect(await page.$eval('[role="option"]', (option) => option.textContent)).toBe(destination)
+    /* keys in the open list stay with it: ⌫ must not delete the frame being
+       moved, nor a letter switch the canvas tool */
+    await page.keyboard.press('Backspace')
+    await page.keyboard.press('r')
+    expect(await page.$$('iframe[data-doop-frame]')).toHaveLength(1)
+    expect(await page.$eval('button[aria-label="Rectangle"]', (b) => b.getAttribute('aria-pressed'))).toBe('false')
+    expect(await page.$('[role="option"]')).not.toBeNull()
+    await page.screenshot({ path: '/tmp/doop-page-move.png' })
+    await page.click('[role="option"]')
+    await page.waitForFunction(
+      (name) => document.querySelector('[aria-current="page"]')?.textContent === name,
+      {},
+      destination,
+    )
+    await page.waitForSelector('iframe[data-doop-frame]')
+    await shortcut()
+    await page.waitForFunction(
+      (id) => document.querySelector(`[data-page-id="${id}"] [aria-current="page"]`),
+      {},
+      source,
+    )
+    await page.waitForSelector('iframe[data-doop-frame]')
+    await shortcut(true)
+    await page.waitForFunction(
+      (name) => document.querySelector('[aria-current="page"]')?.textContent === name,
+      {},
+      destination,
+    )
+    await page.waitForSelector('iframe[data-doop-frame]')
+  }, 20_000)
+
+  it('claims Backspace on the canvas: deletes the selection, never leaves the page', async () => {
+    await page.keyboard.press('Escape')
+    const before = (await page.$$('iframe[data-doop-frame]')).length
+    const url = page.url()
+    await page.evaluate(() => {
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'Backspace') (window as unknown as { prevented: boolean[] }).prevented.push(e.defaultPrevented)
+      })
+      ;(window as unknown as { prevented: boolean[] }).prevented = []
+    })
+    /* nothing selected: the key does nothing, and the browser never sees an
+       unhandled Backspace (some engines take one as "back") */
+    await page.keyboard.press('Backspace')
+    expect(await page.$$('iframe[data-doop-frame]')).toHaveLength(before)
+    expect(page.url()).toBe(url)
+    expect(await page.evaluate(() => (window as unknown as { prevented: boolean[] }).prevented)).toEqual([true])
+    /* a selected frame goes */
+    await page.click('button[aria-label="New frame"]')
+    /* the room's broadcast can paint the frame before the create response
+       selects it; a canvas with one page has no page picker to wait on */
+    await page.waitForSelector('[role="treeitem"][aria-selected="true"]')
+    expect(await page.$$('iframe[data-doop-frame]')).toHaveLength(before + 1)
+    const deleted = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'DELETE' && /^\/api\/frames\//.test(new URL(response.url()).pathname),
+    )
+    await page.keyboard.press('Backspace')
+    expect((await deleted).ok()).toBe(true)
+    await page.waitForFunction((n) => document.querySelectorAll('iframe[data-doop-frame]').length === n, {}, before)
+    expect(page.url()).toBe(url)
+    expect(await page.evaluate(() => (window as unknown as { prevented: boolean[] }).prevented)).toEqual([true, true])
   }, 20_000)
 })

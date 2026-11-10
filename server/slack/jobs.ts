@@ -3,6 +3,7 @@ import { nanoid } from 'nanoid'
 import { z } from 'zod'
 import { db, type Db } from '../db/index.ts'
 import { canvases, tasks, slackInstallations, slackSessions } from '../db/schema.ts'
+import { isBanned } from '../auth.ts'
 import { store } from '../store.ts'
 import * as actions from '../actions.ts'
 import { consumeResidentTask, refundResidentTask } from '../allowance.ts'
@@ -21,6 +22,7 @@ const RUN_TIMEOUT_MS = 60 * 60_000
 const workInFlight = new Set<string>()
 const SLACK_COLOR = '#4A154B'
 const NO_BRIEF = 'Mention @Doop with a design brief, for example “@Doop design a pricing page for a note-taking app”.'
+const SUSPENDED = 'The Doop account behind this Slack agent is suspended, so it cannot design.'
 
 /** A mention or slash command, after the webhook verified its signature. */
 export interface Inbound {
@@ -46,9 +48,12 @@ export async function receiveRequest(inbound: Inbound): Promise<void> {
       .for('share')
     if (!installation || inbound.requesterId === installation.botUserId) return
     const brief = plainText(inbound.text, installation.botUserId)
-    const priorCanvas = inbound.threadTs
-      ? await threadCanvas(tx, inbound.teamId, inbound.channelId, inbound.threadTs)
-      : null
+    const thread = inbound.threadTs
+      ? { teamId: inbound.teamId, channelId: inbound.channelId, threadTs: inbound.threadTs }
+      : undefined
+    const priorCanvas = thread ? await threadCanvas(tx, thread) : null
+    // The thread's first request may not have its canvas yet; dispatch resolves it then.
+    const awaiting = !!thread && !priorCanvas && (await threadAwaiting(tx, thread))
     const now = Date.now()
     await tx
       .insert(slackSessions)
@@ -63,7 +68,7 @@ export async function receiveRequest(inbound: Inbound): Promise<void> {
         title: titleFor(brief),
         prompt: buildPrompt(brief, `Slack member ${inbound.requesterId}`),
         canvasId: priorCanvas,
-        followUp: !!priorCanvas,
+        followUp: !!priorCanvas || awaiting,
         // An empty brief needs no "on it" message, only the hint.
         status: brief ? 'pending' : 'failed',
         error: brief ? null : NO_BRIEF,
@@ -75,27 +80,47 @@ export async function receiveRequest(inbound: Inbound): Promise<void> {
   })
 }
 
+type Thread = { teamId: string; channelId: string; threadTs: string }
+
+const inThread = (thread: Thread) =>
+  and(
+    eq(slackSessions.teamId, thread.teamId),
+    eq(slackSessions.channelId, thread.channelId),
+    eq(slackSessions.threadTs, thread.threadTs),
+  )
+
 /** The canvas an earlier request in this thread was designed on, if any. */
-async function threadCanvas(
-  tx: Pick<Db, 'select'>,
-  teamId: string,
-  channelId: string,
-  threadTs: string,
-): Promise<string | null> {
+async function threadCanvas(tx: Pick<Db, 'select'>, thread: Thread): Promise<string | null> {
   const [row] = await tx
     .select({ canvasId: slackSessions.canvasId })
     .from(slackSessions)
-    .where(
-      and(
-        eq(slackSessions.teamId, teamId),
-        eq(slackSessions.channelId, channelId),
-        eq(slackSessions.threadTs, threadTs),
-        isNotNull(slackSessions.canvasId),
-      ),
-    )
+    .where(and(inThread(thread), isNotNull(slackSessions.canvasId)))
     .orderBy(slackSessions.createdAt)
     .limit(1)
   return row?.canvasId ?? null
+}
+
+/** Whether an earlier request in this thread is still on its way to a canvas.
+ *  A follow-up waits for it instead of designing beside it. `before` bounds
+ *  the search to requests that arrived first — a total order, so the thread's
+ *  first request never waits on a later one. */
+async function threadAwaiting(
+  tx: Pick<Db, 'select'>,
+  thread: Thread,
+  before?: Pick<Session, 'createdAt' | 'id'>,
+): Promise<boolean> {
+  const earlier = before
+    ? or(
+        lt(slackSessions.createdAt, before.createdAt),
+        and(eq(slackSessions.createdAt, before.createdAt), lt(slackSessions.id, before.id)),
+      )
+    : undefined
+  const rows = await tx
+    .select({ id: slackSessions.id })
+    .from(slackSessions)
+    .where(and(inThread(thread), isNull(slackSessions.canvasId), inArray(slackSessions.status, active), earlier))
+    .limit(1)
+  return rows.length > 0
 }
 
 const canvasUrl = (id: string) => `${publicOrigin()}/c/${id}`
@@ -203,17 +228,26 @@ async function dispatch(session: Session) {
       .from(slackSessions)
       .where(and(eq(slackSessions.userId, session.userId), inArray(slackSessions.status, ['preparing', 'running'])))
     if (running.length >= MAX_CONCURRENT) return undefined
+    let canvasId = session.canvasId
+    if (session.followUp && !canvasId && session.threadTs) {
+      const thread = { teamId: session.teamId, channelId: session.channelId, threadTs: session.threadTs }
+      canvasId = await threadCanvas(tx, thread)
+      if (!canvasId && (await threadAwaiting(tx, thread, session))) return undefined
+    }
+    // A follow-up whose earlier request never produced a canvas becomes a design of its own.
     const [row] = await tx
       .update(slackSessions)
-      .set({ status: 'preparing', updatedAt: Date.now() })
+      .set({ status: 'preparing', canvasId, followUp: !!canvasId, updatedAt: Date.now() })
       .where(and(eq(slackSessions.id, session.id), eq(slackSessions.status, 'pending')))
       .returning()
     return row
   })
   if (!claimed) return
+  session = claimed
   let gate: Awaited<ReturnType<typeof consumeResidentTask>> | undefined
   let committed = false
   try {
+    if (await isBanned(session.userId)) throw new Error(SUSPENDED)
     if (!(await pickModel(session.userId)))
       throw new Error('Connect a model account in Doop Settings, then mention @Doop again.')
     gate = await consumeResidentTask(session.userId)
@@ -299,7 +333,7 @@ async function dispatch(session: Session) {
         error:
           error instanceof SlackError
             ? error.message
-            : error instanceof Error && /^(Connect|The design canvas)/.test(error.message)
+            : error instanceof Error && /^(Connect|The design canvas|The Doop account)/.test(error.message)
               ? error.message
               : 'Doop could not start the design. Check your model account in Doop Settings and mention @Doop again.',
         updatedAt: Date.now(),
@@ -326,6 +360,14 @@ async function processSession(session: Session) {
         .where(and(eq(slackSessions.id, session.id), inArray(slackSessions.status, active)))
       return
     }
+    if (await isBanned(installation.userId)) {
+      // Access was revoked after the request was queued: stop the installer's work and say why.
+      const rows = await db.transaction((tx) => cancelStoredSessions(tx, installation.teamId, SUSPENDED))
+      stopPublishedCards(rows, SUSPENDED)
+      const [latest] = await db.select().from(slackSessions).where(eq(slackSessions.id, session.id))
+      if (!latest) return
+      session = latest
+    }
     if (!session.acknowledged && !terminal.includes(session.status)) {
       const ackTs = await post(installation, session, {
         text: session.followUp
@@ -346,11 +388,12 @@ async function processSession(session: Session) {
     }
     if (session.status === 'running' && session.canvasId && session.taskId) {
       const card = actions.getTasks(session.canvasId).find((task) => task.id === session.taskId)
+      // The run's hour starts at dispatch: a request may queue behind the concurrency limit for longer.
       const finished =
         !!card?.failedAt ||
         !!card?.endedAt ||
         !store.getCanvas(session.canvasId) ||
-        Date.now() - session.createdAt > RUN_TIMEOUT_MS
+        Date.now() - (card?.startedAt ?? session.updatedAt) > RUN_TIMEOUT_MS
       // The result carries the link itself, so a finished card never waits on the link update.
       if (!session.linked && !finished) {
         await updateAck(installation, session, `Doop is on it — ${openLink(session.canvasId)}`)

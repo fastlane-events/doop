@@ -9,6 +9,21 @@ lists every file in this folder.
 - [scoped-guidelines.md](scoped-guidelines.md) - Guidelines on the workspace and the whole install
   as well as the canvas, merged by name nearest-scope-first; `style` vs `instructions` docs; the
   organisation's rules appended to `get_guide` and the resident prompt; who may write each scope.
+- [image-descriptions.md](image-descriptions.md) - Model-written descriptions of uploaded images,
+  stored once per asset, billed to the uploader, eligible owner or server behind an
+  Agents setting, and surfaced to MCP and resident agents as `images` per frame.
+- [design-tokens.md](design-tokens.md) - Design tokens and themes: Paper's eleven token types as
+  CSS custom properties per canvas, the managed `<style data-doop-tokens>` block every frame
+  carries, propagation as annotation writes, modes via `data-doop-mode`, REST + MCP + the
+  styleguide export, and the Layers panel's Tokens tab.
+- [prototyping.md](prototyping.md) - Clickable prototypes: interaction data attributes in frame
+  HTML (triggers, actions, transitions, canonical form), per-page flow start, the prototype player
+  and `/c/<id>/proto`, the editor's Prototype mode and connectors, and the MCP tools.
+- [frame-approval.md](frame-approval.md) - Human sign-off for development, revision checks,
+  automatic review invalidation, and approval metadata for MCP and resident agents.
+- [frame-versions.md](frame-versions.md) - Per-frame design history: burst-based snapshots of the
+  HTML a redesign, stream or restore replaced, the `frame_versions` table, REST + MCP restore, and
+  the history modal.
 - [chatgpt-app.md](chatgpt-app.md) - Doop as a ChatGPT app: what app review needs from `/mcp`
   (discovery, DCR, explicit tool annotations, profile tool), the inline preview card component
   (`server/chatgptApp.ts`), the "Claude Design for ChatGPT" marketing page, and the manual
@@ -22,5 +37,8 @@ lists every file in this folder.
 - [comment-notifications.md](comment-notifications.md) - Email for comments and replies people
   were not in the room to see: the canvas event bus, recipient rules, 2-minute coalescing, the
   per-user opt-out, and the `?frame=&comment=` deep link.
+- [share-link-roles.md](share-link-roles.md) - View-only, comment-only and edit share links:
+  `canvasRole` and the read/comment/edit gates across REST, the WebSocket room and MCP, and the
+  editor's read-only mode.
 - [workspaces-billing.md](workspaces-billing.md) - Shared workspaces (org-level canvas access with
   roles) and the per-seat Team plan on Stripe: data model, entitlement rules, API, webhook flow.
