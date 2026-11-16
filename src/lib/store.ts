@@ -1,7 +1,9 @@
 import { create } from 'zustand'
 import { canvasPages, framePageId } from '../../shared/pages'
+import { openingPageId } from './pageLink'
 import { sortByStack } from '../../shared/frameStack'
 import type { DesignToken } from '../../shared/designTokens'
+import type { AgentRole } from '../../shared/agents'
 import type {
   ActivityItem,
   AgentTask,
@@ -107,7 +109,7 @@ interface State {
   /** the Layers rail is showing (desktop); the choice sticks across visits */
   layersOpen: boolean
   /** which face the Layers panel shows: the layer tree, or the design tokens */
-  layersTab: 'layers' | 'tokens'
+  layersTab: 'layers' | 'components' | 'tokens'
   /** ⌘. — every panel and toolbar is off screen, leaving only the canvas.
    *  A plain overlay flag: the panels' own open/closed state is untouched
    *  underneath, so toggling back shows exactly what was open before */
@@ -205,8 +207,16 @@ interface State {
   renameCanvasLocal(name: string): void
   /** upsert (doc set) or remove (doc null) a style guide on the open canvas */
   setGuidelineLocal(name: string, doc: GuidelineDoc | null, scope?: InheritedScope): void
+  /** a component changed in the room, or was deleted (null) */
+  setComponentLocal(id: string, component: import('../../shared/components').ComponentDef | null): void
+  /** counts what the workspace's libraries have published or withdrawn since this
+   *  page loaded: the Components panel reads its library again when it moves */
+  libraryTick: number
+  bumpLibrary(): void
   /** replace the open canvas's design tokens and themes (the room sends the whole list) */
   setTokensLocal(tokens: DesignToken[], themes: string[]): void
+  /** the canvas's Doop Agent team changed (a room `team` message) */
+  setTeamLocal(team: AgentRole[]): void
   /** pin (reference set) or unpin (null) a Memory reference on the open canvas */
   setReferenceLocal(id: string, reference: MemoryReference | null): void
   setDecisions(decisions: DesignDecision[]): void
@@ -262,7 +272,7 @@ interface State {
   pickElements(frameId: string, selectors: string[]): void
   setElementPanelOpen(v: boolean): void
   setLayersOpen(v: boolean): void
-  setLayersTab(tab: 'layers' | 'tokens'): void
+  setLayersTab(tab: 'layers' | 'components' | 'tokens'): void
   toggleUiHidden(): void
   setPrototypeMode(on: boolean): void
   setViewport(v: Viewport): void
@@ -363,7 +373,9 @@ export const useStore = create<State>((set, get) => ({
       activePageId: canvas
         ? canvas.id === s.canvas?.id && canvasPages(canvas).some((p) => p.id === s.activePageId)
           ? s.activePageId
-          : canvasPages(canvas)[0]!.id
+          : /* a canvas being opened starts on the page its URL asks for, so
+               the first paint is already that page */
+            openingPageId(canvas, typeof location === 'undefined' ? '' : location.search)
         : null,
     })),
   setActivePage: (id) =>
@@ -539,6 +551,14 @@ export const useStore = create<State>((set, get) => ({
       }
     }),
   renameCanvasLocal: (name) => set((s) => (s.canvas ? { canvas: { ...s.canvas, name } } : {})),
+  setComponentLocal: (id, component) =>
+    set((s) => {
+      if (!s.canvas) return {}
+      const others = (s.canvas.components ?? []).filter((def) => def.id !== id)
+      return { canvas: { ...s.canvas, components: component ? [...others, component] : others } }
+    }),
+  libraryTick: 0,
+  bumpLibrary: () => set((s) => ({ libraryTick: s.libraryTick + 1 })),
   setGuidelineLocal: (name, doc, scope) =>
     set((s) => {
       if (!s.canvas) return {}
@@ -557,6 +577,7 @@ export const useStore = create<State>((set, get) => ({
     }),
   setTokensLocal: (tokens, themes) =>
     set((s) => (s.canvas ? { canvas: { ...s.canvas, tokens, tokenThemes: themes } } : {})),
+  setTeamLocal: (team) => set((s) => (s.canvas ? { canvas: { ...s.canvas, team } } : {})),
   setReferenceLocal: (id, reference) =>
     set((s) => {
       if (!s.canvas) return {}

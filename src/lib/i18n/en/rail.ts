@@ -15,6 +15,8 @@ export const rail = {
   workspacePeople: 'People',
   workspaceRules: 'Rules',
   workspaceFonts: 'Fonts',
+  workspaceAgents: 'Agents',
+  workspaceLibraries: 'Libraries',
   workspaceBilling: 'Plan & billing',
   workspaceSettings: 'Settings',
   explore: 'Explore',

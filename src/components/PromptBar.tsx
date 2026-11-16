@@ -3,6 +3,7 @@ import { useStore, type ComposerSend } from '../lib/store'
 import { api, type Allowance } from '../lib/api'
 import { posthog } from '../lib/posthog'
 import { uploadImageFrames } from '../lib/frameClipboard'
+import { arrivedDeliverable } from '../lib/composerFlight'
 import { isResidentLimit, meterText, useAllowance } from './TeamAllowance'
 import { Button } from './ui/button'
 import { Textarea } from './ui/textarea'
@@ -13,6 +14,7 @@ import { ArrowUpIcon, AttachmentIcon, FrameIcon, XIcon } from './ui/icons'
 import { ModelPicker } from './ModelPicker'
 import { currentRunnerPick, useRunnerPick } from '../lib/runnerPick'
 import { resolveRunnerPick } from '../../shared/agentRunner'
+import { AGENT_ROLES, DEFAULT_ROLE_ID, mentionedRoles } from '../../shared/agents'
 import { LayerKindIcon } from './LayerKindIcon'
 import { buildLayerTree, findLayer, layerName } from '../lib/layers'
 import type { CardScope } from '../../shared/types'
@@ -70,7 +72,9 @@ let cancelPendingFlight: (() => void) | null = null
  * the panel) while the agent works must not cancel the flight. Leaving the
  * canvas does: another canvas's frames are all "new" to this watch, and a
  * flight there would land on something unrelated. A newer submit replaces
- * an older watch.
+ * an older watch. A component's main is not the deliverable: the watch
+ * keeps waiting past it rather than pulling the person onto the Components
+ * page.
  */
 function flyToNextFrame(canvasId: string, extraKnown: string[]) {
   cancelPendingFlight?.()
@@ -79,7 +83,7 @@ function flyToNextFrame(canvasId: string, extraKnown: string[]) {
     /* null while a canvas loads — only a different canvas ends the watch */
     if (!s.canvas) return
     if (s.canvas.id !== canvasId) return stop()
-    const arrived = s.canvas.frames.find((f) => !known.has(f.id))
+    const arrived = arrivedDeliverable(s.canvas, known)
     if (!arrived) return
     stop()
     s.requestFlyTo(arrived.id)
@@ -141,16 +145,20 @@ async function sendPrompt(args: {
     /* the composer's pick rides on the card, so the task runs on what the
        picker beside the send button shows */
     const runner = currentRunnerPick()
+    /* "@copy tighten the hero" goes to the Copywriter, "@copy @a11y …" to
+       both in that order; no mention is Doop's */
+    const mentioned = mentionedRoles(text, store.canvas?.team ?? AGENT_ROLES).map((role) => role.id)
     await api.addCard(
       canvasId,
       text,
-      ['doop'],
+      mentioned.length > 0 ? mentioned : [DEFAULT_ROLE_ID],
       refFrames.map((f) => f.id),
       scope,
       runner,
     )
     posthog.capture('prompt_bar_submitted', {
       attachments: refFrames.length,
+      agents: mentioned.length,
       scope: scope ? (scope.selector ? 'element' : 'frame') : 'none',
       runner: runner?.provider ?? 'default',
     })
@@ -212,7 +220,8 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   const { allowance } = useAllowance()
   /* the meter names the connection the next task goes to: the composer's pick */
   const runnerStore = useRunnerPick()
-  const pickedProvider = resolveRunnerPick(runnerStore.runners, runnerStore.stored)?.pick.provider
+  const picked = resolveRunnerPick(runnerStore.runners, runnerStore.stored)
+  const pickedProvider = picked?.pick.provider
   /* the selection is the prompt's scope until the chip is dismissed — × or
      Esc drops it entirely, no stepping up to the frame. Keyed on the scope
      so a new selection brings the chip back. */
@@ -242,7 +251,7 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const t = useT()
-  const meter = meterText(allowance, t, pickedProvider)
+  const meter = meterText(allowance, t, pickedProvider, picked?.runner.name)
 
   useLayoutEffect(() => {
     if (inputRef.current) autosize(inputRef.current)
