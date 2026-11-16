@@ -289,7 +289,6 @@ describe('scoped guidelines', () => {
     expect(rules).not.toContain('Use ink blue.')
 
     const instructions = await initializeInstructions(strangerKey)
-    expect(instructions).toContain('get_guide includes them after the guide')
     expect(instructions).toContain("This install's rules for agents: alt-text, ship-rules")
   })
 

@@ -73,6 +73,7 @@ export const actions = {
 
   /* Object */
   frameSelection: 'Frame selection',
+  createComponent: 'Create component',
   group: 'Group selection',
   ungroup: 'Ungroup selection',
   groupName: 'Group',
@@ -141,6 +142,7 @@ export const actions = {
   keyboardShortcuts: 'Keyboard shortcuts',
   docs: 'Docs',
   customerSupport: 'Customer support',
+  upgradeToPro: 'Upgrade to Pro…',
   shortcutsSearch: 'Search shortcuts',
   shortcutsEmpty: 'No shortcut matches “{query}”',
 

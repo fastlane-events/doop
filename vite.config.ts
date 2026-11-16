@@ -23,7 +23,7 @@ export default defineConfig({
     /* agent worktrees live under .claude/ inside the repo; their copies of the
        suite must not run as ours */
     exclude: ['**/node_modules/**', '**/.claude/**'],
-    setupFiles: ['tests/setup.ts'],
+    setupFiles: ['tests/setup.ts', 'tests/forkSchema.setup.ts'],
     globalSetup: ['tests/globalSetup.ts'],
     projects: [
       { test: { name: 'parallel', exclude: clipboardTests } },

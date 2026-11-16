@@ -16,6 +16,8 @@ export const rail: Catalog['rail'] = {
   workspacePeople: 'Pessoas',
   workspaceRules: 'Regras',
   workspaceFonts: 'Fontes',
+  workspaceAgents: 'Agentes',
+  workspaceLibraries: 'Bibliotecas',
   workspaceBilling: 'Plano e cobrança',
   workspaceSettings: 'Configurações',
   explore: 'Explorar',
